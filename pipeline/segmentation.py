@@ -1,151 +1,627 @@
 """
-segmentation.py — YOLO11-seg 및 SAM2를 이용한 사람 인스턴스 마스크 생성.
+segmentation.py — CubeMap face별 사람 검출, 역할 분류, 마스크 생성.
 
 처리 흐름:
-  1. YOLO11-seg로 사람 bounding box + 거친 마스크 추출
-  2. SAM2로 box prompt 기반 정밀 마스크 생성 (선택적)
-  3. 마스크 팽창(dilate) 후 반환
+  1. YOLO11-seg로 person bbox + 거친 mask 추출 (conf >= 0.4)
+  2. SAM2 box prompt로 정밀 mask 생성
+  3. classify_persons()로 PHOTOGRAPHER / BACKGROUND 판별
+  4. PHOTOGRAPHER mask: dilate(15px) + fill_holes
+  5. BACKGROUND: 얼굴 bbox 크롭으로 모자이크 영역 추정
 """
 
 from __future__ import annotations
 
-from pathlib import Path
+import math
+from enum import Enum
+from typing import NamedTuple
 
 import cv2
 import numpy as np
 import torch
+import torch.nn.functional as F
 from loguru import logger
+from scipy import ndimage as ndi
 
 
-class PersonSegmentor:
-    """YOLO11-seg / SAM2 기반 사람 마스크 생성기."""
+# ── 역할 정의 ─────────────────────────────────────────────────────────────
 
-    def __init__(
-        self,
-        yolo_model_path: str | Path = "yolo11x-seg.pt",
-        sam2_model_path: str | Path | None = None,
-        sam2_config: str = "sam2_hiera_l.yaml",
-        person_class_id: int = 0,
-        mask_dilate_px: int = 15,
-        device: str = "cuda",
-        use_sam2: bool = False,
-    ) -> None:
-        self.person_class_id = person_class_id
-        self.mask_dilate_px = mask_dilate_px
-        self.device = device
-        self.use_sam2 = use_sam2
+class PersonRole(Enum):
+    PHOTOGRAPHER = "photographer"   # 완전 제거
+    BACKGROUND   = "background"     # 얼굴 모자이크
 
-        self._load_yolo(yolo_model_path)
-        if use_sam2 and sam2_model_path:
-            self._load_sam2(sam2_model_path, sam2_config)
 
-    # ── 모델 로드 ──────────────────────────────────────────────────────────
+class _Detection(NamedTuple):
+    box: np.ndarray          # xyxy float32 (face 좌표계)
+    mask: torch.Tensor       # (H,W) bool, face 좌표계
+    conf: float
+    pixel_count: int         # mask True 픽셀 수
+    bbox_area: float
 
-    def _load_yolo(self, model_path: str | Path) -> None:
+
+# ── face별 ERP y 범위 (정규화 0~1) ───────────────────────────────────────
+# face 중심 y를 ERP 전체 높이 기준으로 환산할 때 쓰는 매핑
+_FACE_ERP_Y_NORM: dict[str, tuple[float, float]] = {
+    "front": (0.25, 0.75),
+    "back":  (0.25, 0.75),
+    "left":  (0.25, 0.75),
+    "right": (0.25, 0.75),
+    "up":    (0.0,  0.25),
+    "down":  (0.75, 1.0),
+}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PersonSegmenter
+# ═══════════════════════════════════════════════════════════════════════════
+
+class PersonSegmenter:
+    """YOLO11-seg + SAM2 기반 사람 검출 및 역할 분류."""
+
+    def __init__(self, config: dict) -> None:
+        self.config = config
+        self.device = config.get("device", "cuda")
+        if self.device == "cuda" and not torch.cuda.is_available():
+            logger.warning("CUDA 불가 — CPU fallback")
+            self.device = "cpu"
+
+        self.person_class_id: int  = config.get("person_class_id", 0)
+        self.yolo_conf: float      = config.get("yolo_conf", 0.4)
+        self.mask_dilate_px: int   = config.get("mask_dilate_px", 15)
+        self.photographer_y_ratio: float     = config.get("photographer_y_ratio", 0.40)
+        self.photographer_size_weight: float = config.get("photographer_size_weight", 0.5)
+
+        self._load_yolo(config.get("yolo_model", "yolo11x-seg.pt"))
+        if config.get("sam2_model"):
+            self._load_sam2(config["sam2_model"], config.get("sam2_config", "sam2_hiera_l.yaml"))
+        else:
+            self.sam2 = None
+            logger.info("SAM2 비활성화 — YOLO mask 단독 사용")
+
+    # ── 모델 로드 ─────────────────────────────────────────────────────────
+
+    def _load_yolo(self, path: str) -> None:
         from ultralytics import YOLO
-
-        logger.info(f"YOLO 모델 로드: {model_path}")
-        self.yolo = YOLO(str(model_path))
+        logger.info(f"YOLO 로드: {path}")
+        self.yolo = YOLO(str(path))
         self.yolo.to(self.device)
 
-    def _load_sam2(self, model_path: str | Path, config: str) -> None:
+    def _load_sam2(self, model_path: str, config_path: str) -> None:
         try:
             from sam2.build_sam import build_sam2
             from sam2.sam2_image_predictor import SAM2ImagePredictor
-
-            logger.info(f"SAM2 모델 로드: {model_path}")
-            sam2_model = build_sam2(config, str(model_path), device=self.device)
-            self.sam2_predictor = SAM2ImagePredictor(sam2_model)
+            logger.info(f"SAM2 로드: {model_path}")
+            model = build_sam2(config_path, str(model_path), device=self.device)
+            self.sam2 = SAM2ImagePredictor(model)
         except ImportError:
-            logger.warning("SAM2 미설치 — YOLO 마스크만 사용합니다.")
-            self.use_sam2 = False
+            logger.warning("SAM2 미설치 — YOLO mask 단독 사용")
+            self.sam2 = None
 
-    # ── 공개 API ──────────────────────────────────────────────────────────
+    # ── 역할 분류 ─────────────────────────────────────────────────────────
 
-    def segment(self, image: np.ndarray) -> np.ndarray:
+    def classify_persons(
+        self,
+        detections: list[_Detection],
+        face_name: str,
+        erp_h: int,
+        erp_w: int,
+        face_size: int,
+    ) -> list[tuple[PersonRole, float]]:
         """
-        이미지에서 사람을 검출하고 합산 마스크를 반환.
+        각 detection에 대해 (역할, score)를 반환.
+
+        PHOTOGRAPHER는 전체에서 최대 1명.
+        """
+        if not detections:
+            return []
+
+        erp_y_lo, erp_y_hi = _FACE_ERP_Y_NORM[face_name]
+
+        # ── down face: 무조건 전원 PHOTOGRAPHER 후보 ─────────────────────
+        if face_name == "down":
+            results = [(PersonRole.PHOTOGRAPHER, 1.0)] * len(detections)
+            return self._enforce_single_photographer(results, detections)
+
+        # ── up face: 조건1 항상 실패 ─────────────────────────────────────
+        if face_name == "up":
+            # 조건2만 평가
+            biggest_idx = self._biggest_mask_index(detections)
+            scores = []
+            for i, _ in enumerate(detections):
+                cond2 = (i == biggest_idx)
+                s = 0.4 if cond2 else 0.0
+                scores.append(s)
+            return self._scores_to_roles(scores, detections)
+
+        # ── 나머지 face: 조건1 + 조건2 ───────────────────────────────────
+        photographer_y_thresh = 1.0 - self.photographer_y_ratio  # 0.60
+        biggest_idx = self._biggest_mask_index(detections)
+
+        scores = []
+        for i, det in enumerate(detections):
+            # 조건1: bbox 중심 y → ERP y 환산
+            box_cy_norm = (det.box[1] + det.box[3]) / 2.0 / face_size
+            erp_y_norm  = erp_y_lo + box_cy_norm * (erp_y_hi - erp_y_lo)
+            cond1 = erp_y_norm >= photographer_y_thresh
+
+            # 조건2: 가장 큰 mask
+            cond2 = (i == biggest_idx)
+
+            if cond1 and cond2:
+                s = 1.0
+            else:
+                s = (0.6 if cond1 else 0.0) + (0.4 if cond2 else 0.0)
+
+            scores.append(s)
+
+        return self._scores_to_roles(scores, detections)
+
+    # ── 단일 face 세그멘테이션 ────────────────────────────────────────────
+
+    def segment_face(
+        self,
+        face_img: torch.Tensor,
+        face_name: str,
+        erp_h: int,
+        erp_w: int,
+    ) -> dict:
+        """
+        단일 CubeMap face를 처리해 결과 dict 반환.
 
         Args:
-            image: HxWx3 uint8 BGR ndarray.
+            face_img : (3, H, W) float32 tensor [0,1].
+            face_name: "front" | "right" | "back" | "left" | "up" | "down".
+            erp_h, erp_w: 원본 ERP 해상도 (역할 분류 좌표 환산용).
 
         Returns:
-            HxW bool ndarray — True 위치가 사람 영역.
+            {
+              "photographer_mask"    : (H,W) bool tensor,
+              "background_masks"     : list[(H,W) bool tensor],
+              "background_face_masks": list[(H,W) bool tensor],
+              "roles"                : list[PersonRole],
+              "detections"           : list[_Detection],
+              "role_scores"          : list[float],
+            }
         """
-        h, w = image.shape[:2]
-        combined_mask = np.zeros((h, w), dtype=np.uint8)
+        _, fh, fw = face_img.shape
+        empty = {
+            "photographer_mask":     torch.zeros(fh, fw, dtype=torch.bool),
+            "background_masks":      [],
+            "background_face_masks": [],
+            "roles":                 [],
+            "detections":            [],
+            "role_scores":           [],
+        }
 
-        boxes, yolo_masks = self._yolo_predict(image)
-        if not boxes:
-            return combined_mask.astype(bool)
+        # 1) YOLO 검출
+        img_np = self._tensor_to_bgr(face_img)
+        detections = self._yolo_detect(img_np, fh, fw)
+        if not detections:
+            logger.debug(f"[{face_name}] 검출 없음")
+            return empty
 
-        if self.use_sam2 and hasattr(self, "sam2_predictor"):
-            masks = self._sam2_refine(image, boxes)
-        else:
-            masks = yolo_masks
+        # 2) SAM2 정밀화
+        if self.sam2 is not None:
+            detections = self._sam2_refine(img_np, detections, fh, fw)
 
-        for mask in masks:
-            combined_mask = np.maximum(combined_mask, mask.astype(np.uint8))
+        # 3) 역할 분류
+        role_scores = self.classify_persons(detections, face_name, erp_h, erp_w, fh)
 
-        return self._dilate(combined_mask).astype(bool)
+        # 4) 결과 조립
+        photographer_mask = torch.zeros(fh, fw, dtype=torch.bool)
+        bg_masks: list[torch.Tensor] = []
+        bg_face_masks: list[torch.Tensor] = []
+        roles: list[PersonRole] = []
+        scores: list[float] = []
 
-    def segment_faces(
-        self, faces: dict[str, np.ndarray]
-    ) -> dict[str, np.ndarray]:
-        """CubeMap 6-face 딕셔너리에 대해 각각 segment 적용."""
-        return {name: self.segment(face) for name, face in faces.items()}
+        n_photo = sum(1 for role, _ in role_scores if role == PersonRole.PHOTOGRAPHER)
+        n_bg    = sum(1 for role, _ in role_scores if role == PersonRole.BACKGROUND)
+        logger.info(
+            f"[{face_name}] {len(detections)}명 검출 → "
+            f"PHOTOGRAPHER x{n_photo}, BACKGROUND x{n_bg}"
+        )
+        if n_photo == 0:
+            logger.warning(
+                f"[{face_name}] PHOTOGRAPHER 미검출 — "
+                "소스 이미지가 부족하거나 촬영자가 해당 면에 없을 수 있습니다."
+            )
 
-    # ── 내부 처리 ─────────────────────────────────────────────────────────
+        for det, (role, score) in zip(detections, role_scores):
+            roles.append(role)
+            scores.append(score)
 
-    def _yolo_predict(
-        self, image: np.ndarray
-    ) -> tuple[list[np.ndarray], list[np.ndarray]]:
+            if role == PersonRole.PHOTOGRAPHER:
+                dilated = self._dilate_and_fill(det.mask, self.mask_dilate_px)
+                photographer_mask = photographer_mask | dilated
+            else:
+                bg_masks.append(det.mask)
+                bg_face_masks.append(self._face_region_mask(det.box, fh, fw))
+
+        return {
+            "photographer_mask":     photographer_mask,
+            "background_masks":      bg_masks,
+            "background_face_masks": bg_face_masks,
+            "roles":                 roles,
+            "detections":            detections,
+            "role_scores":           scores,
+        }
+
+    # ── 전체 face 처리 ────────────────────────────────────────────────────
+
+    def segment_all_faces(
+        self,
+        faces: dict[str, torch.Tensor],
+        erp_h: int,
+        erp_w: int,
+    ) -> dict[str, dict]:
+        """6개 face 전부 처리, 결과 dict 반환."""
+        return {
+            name: self.segment_face(face_img, name, erp_h, erp_w)
+            for name, face_img in faces.items()
+        }
+
+    # ── 배치 처리 ─────────────────────────────────────────────────────────
+
+    def segment_batch(
+        self,
+        faces_list: list[dict[str, torch.Tensor]],
+        erp_sizes: list[tuple[int, int]],
+    ) -> list[dict[str, dict]]:
+        """
+        여러 이미지 배치 처리. GPU OOM 시 배치를 절반으로 자동 축소.
+
+        Args:
+            faces_list: 각 이미지의 face dict 리스트.
+            erp_sizes : 각 이미지의 (erp_h, erp_w) 리스트.
+        """
+        results: list[dict[str, dict]] = []
+        i = 0
+        while i < len(faces_list):
+            try:
+                r = self.segment_all_faces(faces_list[i], erp_sizes[i][0], erp_sizes[i][1])
+                results.append(r)
+                i += 1
+            except torch.cuda.OutOfMemoryError:
+                logger.warning(f"GPU OOM — 이미지 {i} 처리 중 OOM, 재시도 (캐시 비우기)")
+                torch.cuda.empty_cache()
+                # 재시도 (배치 단위가 아닌 이미지 단위이므로 그냥 재시도)
+                r = self.segment_all_faces(faces_list[i], erp_sizes[i][0], erp_sizes[i][1])
+                results.append(r)
+                i += 1
+        return results
+
+    # ── 시각화 ───────────────────────────────────────────────────────────
+
+    def visualize_classification(
+        self,
+        face_img: torch.Tensor,
+        result: dict,
+    ) -> np.ndarray:
+        """
+        역할별 오버레이 시각화.
+
+        PHOTOGRAPHER → 파란색, BACKGROUND → 빨간색.
+        각 인물 위에 역할 + score 텍스트 표시.
+
+        Returns:
+            HxWx3 uint8 BGR ndarray.
+        """
+        img = self._tensor_to_bgr(face_img).copy()
+
+        photo_mask = result["photographer_mask"]
+        if photo_mask.any():
+            _overlay_mask(img, photo_mask.numpy(), color=(255, 60, 60), alpha=0.4)
+
+        for mask in result["background_masks"]:
+            _overlay_mask(img, mask.numpy(), color=(60, 60, 255), alpha=0.35)
+
+        for det, role, score in zip(
+            result["detections"], result["roles"], result["role_scores"]
+        ):
+            x1, y1, x2, y2 = det.box.astype(int)
+            cx, cy = (x1 + x2) // 2, y1 - 10
+            label = f"{'PHOTO' if role == PersonRole.PHOTOGRAPHER else 'BG'} {score:.2f}"
+            color = (255, 80, 0) if role == PersonRole.PHOTOGRAPHER else (0, 80, 255)
+            cv2.putText(img, label, (cx - 30, max(cy, 15)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
+            cv2.rectangle(img, (x1, y1), (x2, y2), color, 1)
+
+        return img
+
+    # ── 내부: YOLO 검출 ───────────────────────────────────────────────────
+
+    def _yolo_detect(self, img_bgr: np.ndarray, fh: int, fw: int) -> list[_Detection]:
         results = self.yolo.predict(
-            source=image,
+            source=img_bgr,
             classes=[self.person_class_id],
+            conf=self.yolo_conf,
             verbose=False,
             device=self.device,
         )
-
-        boxes: list[np.ndarray] = []
-        masks: list[np.ndarray] = []
-        h, w = image.shape[:2]
-
+        detections: list[_Detection] = []
         for result in results:
             if result.masks is None:
                 continue
-            for seg_mask, box in zip(result.masks.data, result.boxes.xyxy):
-                mask_resized = cv2.resize(
+            for seg_mask, box, conf in zip(
+                result.masks.data, result.boxes.xyxy, result.boxes.conf
+            ):
+                mask_np = cv2.resize(
                     seg_mask.cpu().numpy().astype(np.float32),
-                    (w, h),
+                    (fw, fh),
                     interpolation=cv2.INTER_NEAREST,
                 )
-                masks.append((mask_resized > 0.5).astype(np.uint8))
-                boxes.append(box.cpu().numpy())
+                mask_bool = torch.from_numpy(mask_np > 0.5)
+                box_np = box.cpu().numpy().astype(np.float32)
+                x1, y1, x2, y2 = box_np
+                detections.append(_Detection(
+                    box=box_np,
+                    mask=mask_bool,
+                    conf=float(conf),
+                    pixel_count=int(mask_bool.sum()),
+                    bbox_area=float((x2 - x1) * (y2 - y1)),
+                ))
+        return detections
 
-        return boxes, masks
+    # ── 내부: SAM2 정밀화 ─────────────────────────────────────────────────
 
     def _sam2_refine(
-        self, image: np.ndarray, boxes: list[np.ndarray]
-    ) -> list[np.ndarray]:
-        rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        self.sam2_predictor.set_image(rgb)
+        self, img_bgr: np.ndarray, detections: list[_Detection], fh: int, fw: int
+    ) -> list[_Detection]:
+        rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+        self.sam2.set_image(rgb)
+        refined: list[_Detection] = []
+        for det in detections:
+            try:
+                pred_masks, _, _ = self.sam2.predict(
+                    box=det.box[None],
+                    multimask_output=False,
+                )
+                mask_bool = torch.from_numpy(pred_masks[0].astype(bool))
+                refined.append(_Detection(
+                    box=det.box,
+                    mask=mask_bool,
+                    conf=det.conf,
+                    pixel_count=int(mask_bool.sum()),
+                    bbox_area=det.bbox_area,
+                ))
+            except Exception as e:
+                logger.warning(f"SAM2 실패 ({e}) — YOLO mask 유지")
+                refined.append(det)
+        return refined
 
-        masks: list[np.ndarray] = []
-        for box in boxes:
-            pred_masks, _, _ = self.sam2_predictor.predict(
-                box=box[None],
-                multimask_output=False,
+    # ── 내부: 마스크 후처리 ───────────────────────────────────────────────
+
+    @staticmethod
+    def _dilate_and_fill(mask: torch.Tensor, dilate_px: int) -> torch.Tensor:
+        """dilate + fill_holes."""
+        arr = mask.numpy().astype(np.uint8)
+        if dilate_px > 0:
+            kernel = cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE,
+                (dilate_px * 2 + 1, dilate_px * 2 + 1),
             )
-            masks.append(pred_masks[0].astype(np.uint8))
+            arr = cv2.dilate(arr, kernel, iterations=1)
+        filled = ndi.binary_fill_holes(arr).astype(np.uint8)
+        return torch.from_numpy(filled.astype(bool))
 
-        return masks
+    @staticmethod
+    def _face_region_mask(box: np.ndarray, fh: int, fw: int) -> torch.Tensor:
+        """bbox 상단 30%를 얼굴 영역으로 추정한 mask."""
+        x1, y1, x2, y2 = box.astype(int)
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(fw, x2), min(fh, y2)
+        face_h = max(1, int((y2 - y1) * 0.30))
+        mask = torch.zeros(fh, fw, dtype=torch.bool)
+        mask[y1 : y1 + face_h, x1:x2] = True
+        return mask
 
-    def _dilate(self, mask: np.ndarray) -> np.ndarray:
-        if self.mask_dilate_px <= 0:
-            return mask
-        kernel = cv2.getStructuringElement(
-            cv2.MORPH_ELLIPSE,
-            (self.mask_dilate_px * 2 + 1, self.mask_dilate_px * 2 + 1),
+    # ── 내부: 역할 판별 헬퍼 ─────────────────────────────────────────────
+
+    @staticmethod
+    def _biggest_mask_index(detections: list[_Detection]) -> int:
+        """pixel_count 최대 index (동률 시 bbox_area 큰 쪽)."""
+        best_i, best_px, best_area = 0, -1, -1.0
+        for i, det in enumerate(detections):
+            if det.pixel_count > best_px or (
+                det.pixel_count == best_px and det.bbox_area > best_area
+            ):
+                best_i, best_px, best_area = i, det.pixel_count, det.bbox_area
+        return best_i
+
+    @staticmethod
+    def _scores_to_roles(
+        scores: list[float], detections: list[_Detection]
+    ) -> list[tuple[PersonRole, float]]:
+        """score → role 변환, PHOTOGRAPHER 최대 1명 강제."""
+        roles = []
+        for s in scores:
+            if s >= 0.6:
+                roles.append((PersonRole.PHOTOGRAPHER, s))
+            else:
+                roles.append((PersonRole.BACKGROUND, s))
+        return PersonSegmenter._enforce_single_photographer(roles, detections)
+
+    @staticmethod
+    def _enforce_single_photographer(
+        roles: list[tuple[PersonRole, float]],
+        detections: list[_Detection],
+    ) -> list[tuple[PersonRole, float]]:
+        """PHOTOGRAPHER가 복수이면 score 가장 높은 1명만 유지."""
+        photo_indices = [i for i, (r, _) in enumerate(roles) if r == PersonRole.PHOTOGRAPHER]
+        if len(photo_indices) <= 1:
+            return roles
+
+        # score 동률이면 pixel_count 큰 쪽
+        best = max(
+            photo_indices,
+            key=lambda i: (roles[i][1], detections[i].pixel_count),
         )
-        return cv2.dilate(mask, kernel, iterations=1)
+        result = list(roles)
+        for i in photo_indices:
+            if i != best:
+                result[i] = (PersonRole.BACKGROUND, roles[i][1])
+        return result
+
+    # ── 내부: 이미지 변환 ─────────────────────────────────────────────────
+
+    @staticmethod
+    def _tensor_to_bgr(t: torch.Tensor) -> np.ndarray:
+        """(3,H,W) float32 [0,1] → HxWx3 uint8 BGR."""
+        arr = t.detach().cpu().clamp(0, 1).permute(1, 2, 0).numpy()
+        arr = (arr * 255).astype(np.uint8)
+        return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# FaceMosaicker
+# ═══════════════════════════════════════════════════════════════════════════
+
+class FaceMosaicker:
+    """배경 인물 얼굴 영역 모자이크 처리기."""
+
+    def __init__(
+        self,
+        mosaic_block_size: int = 20,
+        feather_px: int = 8,
+    ) -> None:
+        self.block_size = mosaic_block_size
+        self.feather_px = feather_px
+
+    def mosaic_face(
+        self,
+        face_img: torch.Tensor,
+        face_bbox_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        face_bbox_mask 영역을 블록 평균 모자이크 후 경계 feathering.
+
+        Args:
+            face_img      : (3,H,W) float32 tensor.
+            face_bbox_mask: (H,W) bool tensor.
+
+        Returns:
+            (3,H,W) float32 tensor.
+        """
+        _, h, w = face_img.shape
+        img_np = face_img.permute(1, 2, 0).cpu().numpy().copy()  # HxWx3
+
+        # 마스크 bbox 범위만 처리
+        ys, xs = torch.where(face_bbox_mask)
+        if len(ys) == 0:
+            return face_img
+
+        y1, y2 = int(ys.min()), int(ys.max()) + 1
+        x1, x2 = int(xs.min()), int(xs.max()) + 1
+
+        roi = img_np[y1:y2, x1:x2].copy()
+        bs = self.block_size
+        rh, rw = roi.shape[:2]
+
+        # 블록 평균
+        for by in range(0, rh, bs):
+            for bx in range(0, rw, bs):
+                block = roi[by : by + bs, bx : bx + bs]
+                roi[by : by + bs, bx : bx + bs] = block.mean(axis=(0, 1), keepdims=True)
+
+        # mask 영역에만 적용
+        mosaic_full = img_np.copy()
+        mosaic_full[y1:y2, x1:x2] = roi
+
+        # Gaussian feathering
+        alpha = _gaussian_feather(face_bbox_mask.numpy(), self.feather_px)  # HxWx1
+        blended = img_np * (1 - alpha) + mosaic_full * alpha
+        return torch.from_numpy(blended).permute(2, 0, 1).float()
+
+    def apply_background_mosaics(
+        self,
+        face_img: torch.Tensor,
+        seg_result: dict,
+    ) -> torch.Tensor:
+        """seg_result의 background_face_masks 전부에 모자이크 적용."""
+        result = face_img
+        for mask in seg_result.get("background_face_masks", []):
+            result = self.mosaic_face(result, mask)
+        return result
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MaskPostProcessor
+# ═══════════════════════════════════════════════════════════════════════════
+
+class MaskPostProcessor:
+    """CubeMap face mask → ERP 좌표계 역투영 통합."""
+
+    def expand_mask_to_erp(
+        self,
+        face_masks: dict[str, torch.Tensor],
+        uv_maps: dict[str, torch.Tensor],
+        erp_h: int,
+        erp_w: int,
+    ) -> torch.Tensor:
+        """
+        PHOTOGRAPHER mask(face 좌표계)를 ERP 좌표계로 역투영해 통합.
+
+        Args:
+            face_masks: {"front": (H,W) bool, ...} — PHOTOGRAPHER mask만 전달.
+            uv_maps   : CubeMapConverter.get_face_uv_map() 결과.
+                        {"front": (2,H,W) float32 [0,1], ...}
+            erp_h, erp_w: 출력 ERP 해상도.
+
+        Returns:
+            (erp_h, erp_w) bool tensor — ERP 상의 PHOTOGRAPHER 영역.
+        """
+        erp_mask = torch.zeros(erp_h, erp_w, dtype=torch.bool)
+
+        for face_name, fmask in face_masks.items():
+            if not fmask.any():
+                continue
+            uv = uv_maps.get(face_name)
+            if uv is None:
+                logger.warning(f"UV 맵 없음: {face_name} — skip")
+                continue
+
+            # uv: (2,H,W)  →  u=(0), v=(1)
+            u = uv[0]  # (H,W) [0,1]
+            v = uv[1]  # (H,W) [0,1]
+
+            # face mask True 위치의 ERP 픽셀 좌표 계산
+            ys_face, xs_face = torch.where(fmask)
+            u_vals = u[ys_face, xs_face]
+            v_vals = v[ys_face, xs_face]
+
+            ex = (u_vals * (erp_w - 1)).long().clamp(0, erp_w - 1)
+            ey = (v_vals * (erp_h - 1)).long().clamp(0, erp_h - 1)
+
+            erp_mask[ey, ex] = True
+
+        # 역투영 시 생기는 구멍 메우기 (소규모 dilate)
+        erp_np = erp_mask.numpy().astype(np.uint8)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        erp_np = cv2.dilate(erp_np, kernel, iterations=2)
+        return torch.from_numpy(erp_np.astype(bool))
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 내부 유틸
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _overlay_mask(
+    img: np.ndarray,
+    mask: np.ndarray,
+    color: tuple[int, int, int],
+    alpha: float,
+) -> None:
+    """img 위에 mask 영역을 color로 반투명 오버레이 (in-place)."""
+    overlay = img.copy()
+    overlay[mask.astype(bool)] = color
+    cv2.addWeighted(overlay, alpha, img, 1 - alpha, 0, img)
+
+
+def _gaussian_feather(mask: np.ndarray, radius: int) -> np.ndarray:
+    """mask를 Gaussian blur해 HxWx1 float32 alpha 맵 반환."""
+    if radius <= 0:
+        return mask.astype(np.float32)[..., np.newaxis]
+    ksize = radius * 2 + 1
+    alpha = cv2.GaussianBlur(
+        mask.astype(np.float32), (ksize, ksize), radius
+    )
+    return np.clip(alpha, 0, 1)[..., np.newaxis]

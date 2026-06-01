@@ -38,6 +38,13 @@ input_dir: ./input
 output_dir: ./output
 model_dir: ./models             # 다운로드된 모델 가중치 저장 위치
 
+# ── Segmentation 세부 ────────────────────────────────────────
+yolo_conf: 0.4                  # YOLO 검출 신뢰도 임계값
+photographer_y_ratio: 0.40      # ERP 하단 이 비율 이내 → PHOTOGRAPHER 조건1
+photographer_size_weight: 0.5   # 크기 조건 가중치 (현재 score 계산에 반영)
+mosaic_block_size: 20           # 배경 인물 얼굴 모자이크 블록 크기 (px)
+mosaic_feather_px: 8            # 모자이크 경계 feathering 폭 (px)
+
 # ── 디버그 / 시각화 ──────────────────────────────────────────
 save_debug_masks: false         # 중간 마스크 저장 여부
 save_cubemap_faces: false       # CubeMap face 저장 여부
