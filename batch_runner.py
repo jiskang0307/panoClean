@@ -25,7 +25,6 @@ import yaml
 from loguru import logger
 from tqdm import tqdm
 
-from pipeline.blending import PatchBlender, SeamlessBlender
 from pipeline.cubemap import FACE_NAMES, CubeMapConverter
 from pipeline.cubemap import load_erp as load_erp_tensor
 from pipeline.cubemap import save_erp as save_erp_tensor
@@ -119,12 +118,10 @@ def _process_single(
 ) -> dict[str, torch.Tensor]:
     """단일 이미지의 6개 face를 순차 처리."""
 
-    # Segment all faces at once
     seg_results = segmenter.segment_all_faces(target_faces, erp_h, erp_w)
 
     result_faces: dict[str, torch.Tensor] = {}
     top_k = cfg.get("top_k_sources", 3)
-    min_cov = cfg.get("min_coverage_ratio", 0.85)
     lama_on = cfg.get("lama_enabled", True)
 
     for face_name in FACE_NAMES:
@@ -146,49 +143,73 @@ def _process_single(
             result_faces[face_name] = face_img
             continue
 
-        best_sources = matcher.select_best_sources(
-            face_img, src_candidates, photo_mask,
-            top_k=top_k, face_name=face_name,
-        )
+        if face_name == "down":
+            # down face: 배경 교체 시도 후 LaMa로 전량 처리
+            try:
+                best_sources = matcher.select_best_sources(
+                    face_img, src_candidates, photo_mask,
+                    top_k=top_k, face_name=face_name,
+                )
+                if best_sources:
+                    warped_bg = matcher.blend_multiple_sources(
+                        face_img, photo_mask, best_sources, face_name=face_name
+                    )
+                    coverage = best_sources[0][2]
+                else:
+                    warped_bg = face_img
+                    coverage = 0.0
+            except Exception as exc:
+                logger.warning(f"[down] 배경 교체 실패: {exc}")
+                warped_bg = face_img
+                coverage = 0.0
 
-        # ── 배경 블렌딩 ─────────────────────────────────────────────────
-        if best_sources:
-            restored = matcher.blend_multiple_sources(
-                face_img, photo_mask, best_sources, face_name=face_name
-            )
-            best_cov = best_sources[0][2]
+            logger.debug(f"[down] matching_coverage={coverage:.3f}")
+
+            if lama_on:
+                result_faces[face_name] = inpainter.inpaint_residual(
+                    warped_bg, photo_mask,
+                    filled_mask=(coverage > 0.3),
+                    face_name="down",
+                )[0]
+            else:
+                result_faces[face_name] = warped_bg
+
         else:
-            restored = face_img
-            best_cov = 0.0
+            # 나머지 face: 배경 교체 → 잔여 영역만 LaMa
+            best_sources = matcher.select_best_sources(
+                face_img, src_candidates, photo_mask,
+                top_k=top_k, face_name=face_name,
+            )
+            if best_sources:
+                warped_bg = matcher.blend_multiple_sources(
+                    face_img, photo_mask, best_sources, face_name=face_name
+                )
+                best_cov = best_sources[0][2]
+            else:
+                warped_bg = face_img
+                best_cov = 0.0
 
-        logger.debug(f"[{face_name}] best_coverage={best_cov:.3f}")
+            logger.debug(f"[{face_name}] best_coverage={best_cov:.3f}")
 
-        # ── 잔여 영역 LaMa inpainting ───────────────────────────────────
-        if lama_on:
-            filled = photo_mask & ((restored - face_img).abs().sum(0) > 0.02)
-            coverage = SeamlessBlender.compute_coverage(photo_mask, filled)
-
-            if coverage < min_cov:
-                logger.info(f"[{face_name}] LaMa 보완 시작 (coverage={coverage:.3f})")
-                restored = _lama_inpaint_tensor(restored, photo_mask, filled, inpainter)
-
-        result_faces[face_name] = restored
+            if lama_on:
+                filled_mask = _filled_pixels(warped_bg, face_img, photo_mask)
+                result, _ = inpainter.inpaint_residual(
+                    warped_bg, photo_mask, filled_mask, face_name=face_name
+                )
+                result_faces[face_name] = result
+            else:
+                result_faces[face_name] = warped_bg
 
     return result_faces
 
 
-def _lama_inpaint_tensor(
-    img: torch.Tensor,
-    full_mask: torch.Tensor,
-    filled_mask: torch.Tensor,
-    inpainter: LamaInpainter,
+def _filled_pixels(
+    restored: torch.Tensor,
+    original: torch.Tensor,
+    mask: torch.Tensor,
 ) -> torch.Tensor:
-    """tensor (3,H,W) → LaMa inpainting → tensor."""
-    arr = img.detach().cpu().clamp(0, 1).permute(1, 2, 0).numpy()
-    bgr = cv2.cvtColor((arr * 255).astype(np.uint8), cv2.COLOR_RGB2BGR)
-    result_bgr = inpainter.inpaint_residual(bgr, full_mask.numpy(), filled_mask.numpy())
-    rgb = cv2.cvtColor(result_bgr, cv2.COLOR_BGR2RGB)
-    return torch.from_numpy(rgb).float().permute(2, 0, 1).to(img.device) / 255.0
+    """배경 교체로 실제 변경된 픽셀을 pixel-diff 기반으로 추정."""
+    return mask & ((restored - original).abs().sum(0) > 0.02)
 
 
 def _save_cmp(src: torch.Tensor, dst: torch.Tensor, path: Path) -> None:
@@ -218,9 +239,18 @@ def main() -> None:
         face_size=cfg.get("cubemap_face_size", 1024),
         device=device,
     )
+    debug_dir = Path("debug_output") if (args.debug or cfg.get("save_debug_masks")) else None
+
     segmenter = PersonSegmenter(cfg)
     matcher   = BackgroundMatcher(cfg)
-    inpainter = LamaInpainter(device=device)
+    inpainter = LamaInpainter(
+        device=device,
+        debug_dir=debug_dir,
+        residual_threshold=cfg.get("lama_residual_threshold", 0.05),
+        down_face_size=cfg.get("lama_down_face_size", 256),
+        feather_px=cfg.get("lama_feather_px", 8),
+        down_feather_px=cfg.get("lama_down_feather_px", 30),
+    )
     mosaicker = FaceMosaicker(
         mosaic_block_size=cfg.get("mosaic_block_size", 20),
         feather_px=cfg.get("mosaic_feather_px", 8),

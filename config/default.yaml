@@ -29,6 +29,10 @@ min_coverage_ratio: 0.85        # 이 비율 이상 채워지면 inpainting 생�
 # ── LaMa Inpainting ─────────────────────────────────────────
 lama_enabled: true
 lama_device: cuda               # cuda | cpu
+lama_residual_threshold: 0.05   # 잔여 비율 이 미만이면 inpainting 스킵
+lama_down_face_size: 256        # down face inpainting 다운샘플 해상도
+lama_feather_px: 8              # 일반 face 경계 feathering sigma (px)
+lama_down_feather_px: 30        # down face 경계 feathering sigma (px)
 
 # ── 배치 처리 ────────────────────────────────────────────────
 batch_size: 4                   # 동시 처리 이미지 수
