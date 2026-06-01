@@ -153,10 +153,15 @@ class LamaInpainter:
             mode="bilinear", align_corners=False
         ).squeeze(0).to(face_img.device)
 
-        mask_np = mask.cpu().numpy().astype(np.uint8)
-        alpha = self._feather_mask(mask_np, sigma=self.down_feather_px)
-        alpha_t = torch.from_numpy(alpha).to(face_img.device).unsqueeze(0)
-        blended = (face_img * (1.0 - alpha_t) + result_t * alpha_t).clamp(0, 1)
+        if self.down_feather_px > 0:
+            mask_np = mask.cpu().numpy().astype(np.uint8)
+            alpha   = self._feather_mask(mask_np, sigma=self.down_feather_px)
+            alpha_t = torch.from_numpy(alpha).to(face_img.device).unsqueeze(0)
+            blended = (face_img * (1.0 - alpha_t) + result_t * alpha_t).clamp(0, 1)
+        else:
+            # feathering=0: hard composite (경계 번짐 없음)
+            mask_t  = mask.float().unsqueeze(0).to(face_img.device)
+            blended = (face_img * (1.0 - mask_t) + result_t * mask_t).clamp(0, 1)
 
         if self.debug_dir:
             self._save_diff_debug(face_img, blended, mask, "down")

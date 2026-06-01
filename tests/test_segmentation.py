@@ -103,11 +103,11 @@ class TestClassifyPersons:
 
     def test_front_face_bottom_person_is_photographer(self):
         from pipeline.segmentation import PersonRole
-        # 새 임계값(erp_h*0.75): side face bbox center는 수학적으로 해당 임계값 미달
-        # → cond1 항상 False → score 최대 0.4 → BACKGROUND
+        # face 하단 30% 임계값(face_h*0.70=44.8): y2=63 >= 44.8 → cond1=True
+        # 단독 검출이므로 cond2=True → score=1.0 → PHOTOGRAPHER
         dets = [_make_detection([10, 50, 50, 63], pixel_count=500)]  # 하단
         roles = self.seg.classify_persons(dets, "front", 512, 1024, 64)
-        assert roles[0][0] == PersonRole.BACKGROUND
+        assert roles[0][0] == PersonRole.PHOTOGRAPHER
 
     def test_front_face_top_person_is_background(self):
         from pipeline.segmentation import PersonRole
@@ -129,15 +129,16 @@ class TestClassifyPersons:
 
     def test_score_partial_conditions(self):
         from pipeline.segmentation import PersonRole
-        # side face: cond1 항상 False → 최대 score=0.4 → 전부 BACKGROUND
-        # 두 명 중 큰 mask(cond2=True)는 score=0.4, 작은 mask는 score=0.0
+        # face_h=64, threshold_y=44.8
+        # det0: y2=63 >= 44.8 → cond1=True, pixel=50 (작음) → cond2=False → score=0.6 → PHOTOGRAPHER
+        # det1: y2=20 < 44.8  → cond1=False, pixel=500(큰)  → cond2=True  → score=0.4 → BACKGROUND
         dets2 = [
-            _make_detection([10, 50, 30, 63], pixel_count=50),   # 작은 mask
-            _make_detection([10, 5,  30, 20], pixel_count=500),  # 큰 mask
+            _make_detection([10, 50, 30, 63], pixel_count=50),   # 하단 작은 mask
+            _make_detection([10, 5,  30, 20], pixel_count=500),  # 상단 큰 mask
         ]
         roles = self.seg.classify_persons(dets2, "front", 512, 1024, 64)
-        assert roles[0][0] == PersonRole.BACKGROUND  # 작은 → score=0.0
-        assert roles[1][0] == PersonRole.BACKGROUND  # 큰   → score=0.4
+        assert roles[0][0] == PersonRole.PHOTOGRAPHER  # 하단 → score=0.6
+        assert roles[1][0] == PersonRole.BACKGROUND    # 상단 → score=0.4
 
 
 # ═══════════════════════════════════════════════════════════════════════════

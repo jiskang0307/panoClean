@@ -123,22 +123,30 @@ class CubeMapConverter:
         faces: dict[FaceName, torch.Tensor],
         erp_height: int,
         erp_width: int,
+        no_blend_faces: tuple[str, ...] | list[str] = ("down",),
     ) -> torch.Tensor:
         """
         6개 face dict를 ERP tensor로 합성.
 
         면 경계는 8px gaussian blend로 처리.
+        no_blend_faces에 포함된 face는 seam blend 없이 원본 그대로 합성.
 
         Args:
-            faces     : erp_to_cubemap 반환값과 동일한 구조.
-            erp_height: 출력 ERP 높이.
-            erp_width : 출력 ERP 너비.
+            faces          : erp_to_cubemap 반환값과 동일한 구조.
+            erp_height     : 출력 ERP 높이.
+            erp_width      : 출력 ERP 너비.
+            no_blend_faces : seam blend를 생략할 face 이름 목록.
+                             기본값 ("down",) — 넓은 inpainting 영역 번짐 방지.
 
         Returns:
             (3, erp_height, erp_width) float32 tensor (device 유지).
         """
-        # seam blend 후 변환
-        blended = self.blend_seams(faces)
+        # no_blend_faces는 blend_seams에 넣지 않고 원본 그대로 사용
+        blend_input  = {k: v for k, v in faces.items() if k not in no_blend_faces}
+        pass_through = {k: v for k, v in faces.items() if k in no_blend_faces}
+
+        blended = self.blend_seams(blend_input)
+        blended.update(pass_through)   # down face 원본 그대로 삽입
         logger.debug(f"cubemap_to_erp: → ({erp_height}, {erp_width})")
 
         if _BACKEND == "equilib":

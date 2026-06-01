@@ -127,18 +127,16 @@ class PersonSegmenter:
         if face_name == "up":
             return [(PersonRole.BACKGROUND, 0.0)] * len(detections)
 
-        # ── 나머지 face: ERP y 오프셋 기반 조건1 + 조건2 ─────────────────
-        # face 픽셀 y → ERP 절대 y (px) 환산
-        # front/back/left/right는 ERP 25%~75% 구간에 매핑됨
-        offset = erp_h * 0.25
-        scale  = erp_h * 0.5 / face_size  # face_size px → ERP 50% 범위
+        # ── 나머지 face: face 픽셀 좌표 기반 조건1 + 조건2 ─────────────────
+        # 조건1: bbox 하단(y2)이 face 하단 30% 이내에 걸쳐있으면 촬영자 후보
+        # (ERP y 환산 대신 face 픽셀 좌표 직접 사용 — 환산 오차 제거)
+        threshold_y = face_size * 0.70   # face 하단 30% 경계
         biggest_idx = self._biggest_mask_index(detections)
 
         scores = []
         for i, det in enumerate(detections):
-            bbox_center_y = (det.box[1] + det.box[3]) / 2.0
-            erp_y = offset + bbox_center_y * scale
-            cond1 = erp_y >= erp_h * 0.75   # down face 경계 이상 = 바닥 근처
+            bbox_bottom = float(det.box[3])          # y2
+            cond1 = bbox_bottom >= threshold_y       # 하단 30%에 걸치면 통과
 
             cond2 = (i == biggest_idx)
 
