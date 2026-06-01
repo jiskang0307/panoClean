@@ -269,8 +269,7 @@ class BackgroundMatcher:
             logger.warning(f"[{face_name}] 유효 소스 없음 — 원본 유지")
             return target
 
-        # 정규화
-        accum[:, covered] /= w_map[covered]   # (3,N) / (N,) broadcast 안 되므로:
+        # 정규화: (3,N) / (1,N)
         accum[:, covered] = accum[:, covered] / w_map[covered].unsqueeze(0)
 
         # ── 타깃 위에 합성 ─────────────────────────────────────────────────
@@ -282,7 +281,7 @@ class BackgroundMatcher:
         try:
             target_bgr  = self._t2bgr(target)
             patched_bgr = self._t2bgr(result)
-            mask_u8     = mask.numpy().astype(np.uint8)
+            mask_u8     = mask.numpy().astype(np.uint8) * 255  # bool → 0/255
 
             # 극 영역은 Poisson 실패 확률이 높아 바로 alpha fallback
             if face_name in POLAR_FACES:

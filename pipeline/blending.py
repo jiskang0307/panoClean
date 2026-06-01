@@ -202,9 +202,6 @@ class PatchBlender:
 # ── 내부 유틸 ─────────────────────────────────────────────────────────────
 
 def _ensure_u8_mask(mask: np.ndarray) -> np.ndarray:
-    """bool 또는 float mask를 0/255 uint8로 변환."""
-    if mask.dtype == bool:
-        return (mask.astype(np.uint8)) * 255
-    if mask.max() <= 1.0 and mask.dtype != np.uint8:
-        return (mask * 255).astype(np.uint8)
-    return mask.astype(np.uint8)
+    """어떤 dtype이든 0/255 uint8 마스크로 정규화."""
+    # bool, 0/1 uint8, 0/1 float 모두 → 0/255 uint8
+    return (mask.astype(bool).astype(np.uint8)) * 255
