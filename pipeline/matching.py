@@ -197,6 +197,7 @@ class BackgroundMatcher:
             [(warped_bg, H_matrix, coverage_ratio), ...] — coverage 내림차순.
         """
         results: list[tuple[torch.Tensor, np.ndarray, float]] = []
+        mask = mask.to(target_face.device)
         mask_total = int(mask.sum())
         if mask_total == 0:
             return results
@@ -246,6 +247,7 @@ class BackgroundMatcher:
         if not sources:
             return target
 
+        mask = mask.to(target.device)
         _, h, w = target.shape
         cov_arr = np.array([c for _, _, c in sources], dtype=np.float32)
 
@@ -254,8 +256,8 @@ class BackgroundMatcher:
         weights = exp_c / exp_c.sum()
 
         # ── weighted blend ────────────────────────────────────────────────
-        accum    = torch.zeros_like(target)    # (3, H, W)
-        w_map    = torch.zeros(h, w)           # (H, W)
+        accum    = torch.zeros_like(target)                      # (3, H, W)
+        w_map    = torch.zeros(h, w, device=target.device)   # (H, W)
 
         for (warped_bg, _, _), weight in zip(sources, weights):
             valid = mask & (warped_bg.sum(0) > 0.01)
@@ -281,7 +283,7 @@ class BackgroundMatcher:
         try:
             target_bgr  = self._t2bgr(target)
             patched_bgr = self._t2bgr(result)
-            mask_u8     = mask.numpy().astype(np.uint8) * 255  # bool → 0/255
+            mask_u8     = mask.cpu().numpy().astype(np.uint8) * 255  # bool → 0/255
 
             # 극 영역은 Poisson 실패 확률이 높아 바로 alpha fallback
             if face_name in POLAR_FACES:

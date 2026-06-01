@@ -155,7 +155,7 @@ else:
 
     # dummy mask로 warp 테스트
     h = w = FACE_SIZE
-    mask = torch.zeros(h, w, dtype=torch.bool)
+    mask = torch.zeros(h, w, dtype=torch.bool, device=DEVICE)
     mask[h//4 : h*3//4, w//4 : w*3//4] = True   # 중앙 50%
 
     H_mat, _ = matcher.find_homography(faces1["front"], faces["front"], "front")
@@ -170,7 +170,7 @@ else:
 
         # warp 결과 저장
         warp_vis = t2bgr(warped)
-        mask_vis = (mask.numpy().astype(np.uint8) * 128)
+        mask_vis = (mask.cpu().numpy().astype(np.uint8) * 128)
         mask_vis_bgr = cv2.cvtColor(mask_vis, cv2.COLOR_GRAY2BGR)
         cv2.imwrite(str(OUTPUT / "smoke_warp.jpg"), np.hstack([t2bgr(faces["front"]), warp_vis]))
         ok("warp 시각화 저장: output/smoke_warp.jpg")

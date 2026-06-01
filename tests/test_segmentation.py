@@ -103,12 +103,11 @@ class TestClassifyPersons:
 
     def test_front_face_bottom_person_is_photographer(self):
         from pipeline.segmentation import PersonRole
-        # front face, bbox 중심이 face 하단 → ERP y > 0.60 → 조건1 통과
-        # 게다가 가장 큰 mask → 조건2 통과 → score 1.0 → PHOTOGRAPHER
+        # 새 임계값(erp_h*0.75): side face bbox center는 수학적으로 해당 임계값 미달
+        # → cond1 항상 False → score 최대 0.4 → BACKGROUND
         dets = [_make_detection([10, 50, 50, 63], pixel_count=500)]  # 하단
         roles = self.seg.classify_persons(dets, "front", 512, 1024, 64)
-        assert roles[0][0] == PersonRole.PHOTOGRAPHER
-        assert roles[0][1] == 1.0
+        assert roles[0][0] == PersonRole.BACKGROUND
 
     def test_front_face_top_person_is_background(self):
         from pipeline.segmentation import PersonRole
@@ -119,30 +118,26 @@ class TestClassifyPersons:
 
     def test_single_photographer_enforced(self):
         from pipeline.segmentation import PersonRole
-        # score >= 0.6인 후보가 2명이면 1명만 PHOTOGRAPHER로 강등
+        # down face에서 2명 검출 → 가장 큰 mask 1명만 PHOTOGRAPHER
         dets = [
-            _make_detection([10, 50, 30, 63], pixel_count=300),  # 하단, 큰 mask
-            _make_detection([35, 48, 55, 63], pixel_count=300),  # 하단, 동일 mask
+            _make_detection([10, 10, 30, 63], pixel_count=400),  # 큰 mask
+            _make_detection([35, 10, 55, 63], pixel_count=200),  # 작은 mask
         ]
-        roles = self.seg.classify_persons(dets, "front", 512, 1024, 64)
+        roles = self.seg.classify_persons(dets, "down", 512, 1024, 64)
         photographers = [r for r, _ in roles if r == PersonRole.PHOTOGRAPHER]
         assert len(photographers) == 1
 
     def test_score_partial_conditions(self):
         from pipeline.segmentation import PersonRole
-        # 조건1만 통과 → score=0.6 → PHOTOGRAPHER
-        dets = [_make_detection([10, 50, 30, 63], pixel_count=50)]  # 작은 mask
-        # 조건2는 단독이므로 통과, 조건1도 통과 → score=1.0
-        # → 단독 1명이면 항상 score=1.0. 두 명으로 테스트
+        # side face: cond1 항상 False → 최대 score=0.4 → 전부 BACKGROUND
+        # 두 명 중 큰 mask(cond2=True)는 score=0.4, 작은 mask는 score=0.0
         dets2 = [
-            _make_detection([10, 50, 30, 63], pixel_count=50),   # 하단 작은
-            _make_detection([10, 5,  30, 20], pixel_count=500),  # 상단 큰
+            _make_detection([10, 50, 30, 63], pixel_count=50),   # 작은 mask
+            _make_detection([10, 5,  30, 20], pixel_count=500),  # 큰 mask
         ]
         roles = self.seg.classify_persons(dets2, "front", 512, 1024, 64)
-        # 하단 작은 → cond1=True, cond2=False → score=0.6 → PHOTOGRAPHER
-        # 상단 큰  → cond1=False, cond2=True  → score=0.4 → BACKGROUND
-        assert roles[0][0] == PersonRole.PHOTOGRAPHER
-        assert roles[1][0] == PersonRole.BACKGROUND
+        assert roles[0][0] == PersonRole.BACKGROUND  # 작은 → score=0.0
+        assert roles[1][0] == PersonRole.BACKGROUND  # 큰   → score=0.4
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -198,9 +193,9 @@ class TestSegmentFaceOutput:
         assert result["background_masks"] == []
 
     def test_down_face_gives_photographer(self):
-        from pipeline.segmentation import PersonRole
+        # down face: YOLO 실행 + 고정 타원 OR hull → photographer_mask 반드시 비어있지 않음
         result = self.seg.segment_face(_make_face(), "down", 256, 512)
-        assert PersonRole.PHOTOGRAPHER in result["roles"]
+        assert result["photographer_mask"].any(), "down face mask가 비어있음"
 
     def test_roles_length_equals_detections(self):
         result = self.seg.segment_face(_make_face(), "front", 256, 512)

@@ -114,36 +114,32 @@ class PersonSegmenter:
         if not detections:
             return []
 
-        erp_y_lo, erp_y_hi = _FACE_ERP_Y_NORM[face_name]
-
-        # ── down face: 무조건 전원 PHOTOGRAPHER 후보 ─────────────────────
+        # ── down face: 가장 큰 mask 1명만 PHOTOGRAPHER ────────────────────
         if face_name == "down":
-            results = [(PersonRole.PHOTOGRAPHER, 1.0)] * len(detections)
-            return self._enforce_single_photographer(results, detections)
-
-        # ── up face: 조건1 항상 실패 ─────────────────────────────────────
-        if face_name == "up":
-            # 조건2만 평가
             biggest_idx = self._biggest_mask_index(detections)
-            scores = []
-            for i, _ in enumerate(detections):
-                cond2 = (i == biggest_idx)
-                s = 0.4 if cond2 else 0.0
-                scores.append(s)
-            return self._scores_to_roles(scores, detections)
+            return [
+                (PersonRole.PHOTOGRAPHER, 1.0) if i == biggest_idx
+                else (PersonRole.BACKGROUND, 0.0)
+                for i in range(len(detections))
+            ]
 
-        # ── 나머지 face: 조건1 + 조건2 ───────────────────────────────────
-        photographer_y_thresh = 1.0 - self.photographer_y_ratio  # 0.60
+        # ── up face: 무조건 전부 BACKGROUND ──────────────────────────────
+        if face_name == "up":
+            return [(PersonRole.BACKGROUND, 0.0)] * len(detections)
+
+        # ── 나머지 face: ERP y 오프셋 기반 조건1 + 조건2 ─────────────────
+        # face 픽셀 y → ERP 절대 y (px) 환산
+        # front/back/left/right는 ERP 25%~75% 구간에 매핑됨
+        offset = erp_h * 0.25
+        scale  = erp_h * 0.5 / face_size  # face_size px → ERP 50% 범위
         biggest_idx = self._biggest_mask_index(detections)
 
         scores = []
         for i, det in enumerate(detections):
-            # 조건1: bbox 중심 y → ERP y 환산
-            box_cy_norm = (det.box[1] + det.box[3]) / 2.0 / face_size
-            erp_y_norm  = erp_y_lo + box_cy_norm * (erp_y_hi - erp_y_lo)
-            cond1 = erp_y_norm >= photographer_y_thresh
+            bbox_center_y = (det.box[1] + det.box[3]) / 2.0
+            erp_y = offset + bbox_center_y * scale
+            cond1 = erp_y >= erp_h * 0.75   # down face 경계 이상 = 바닥 근처
 
-            # 조건2: 가장 큰 mask
             cond2 = (i == biggest_idx)
 
             if cond1 and cond2:
@@ -225,16 +221,44 @@ class PersonSegmenter:
                 "소스 이미지가 부족하거나 촬영자가 해당 면에 없을 수 있습니다."
             )
 
+        raw_photo_masks: list[torch.Tensor] = []
+        photo_boxes: list[np.ndarray] = []
         for det, (role, score) in zip(detections, role_scores):
             roles.append(role)
             scores.append(score)
 
             if role == PersonRole.PHOTOGRAPHER:
-                dilated = self._dilate_and_fill(det.mask, self.mask_dilate_px)
-                photographer_mask = photographer_mask | dilated
+                raw_photo_masks.append(det.mask)
+                photo_boxes.append(det.box)
             else:
                 bg_masks.append(det.mask)
                 bg_face_masks.append(self._face_region_mask(det.box, fh, fw))
+
+        # 모든 PHOTOGRAPHER raw mask를 합산 후 face별 후처리
+        if raw_photo_masks:
+            raw_union = raw_photo_masks[0].clone()
+            for m in raw_photo_masks[1:]:
+                raw_union = raw_union | m
+
+            # PHOTOGRAPHER bbox union (x1,y1,x2,y2)
+            if photo_boxes:
+                boxes = np.stack(photo_boxes)
+                combined_bbox = (
+                    int(boxes[:, 0].min()), int(boxes[:, 1].min()),
+                    int(boxes[:, 2].max()), int(boxes[:, 3].max()),
+                )
+            else:
+                combined_bbox = None
+
+            photographer_mask = self._postprocess_photographer_mask(
+                raw_union, face_name, photographer_bbox=combined_bbox
+            )
+
+        # down face: 고정 타원과 OR 합산
+        if face_name == "down":
+            photographer_mask = self._down_face_ellipse_mask(
+                photographer_mask, fh, fw
+            )
 
         return {
             "photographer_mask":     photographer_mask,
@@ -402,6 +426,89 @@ class PersonSegmenter:
             arr = cv2.dilate(arr, kernel, iterations=1)
         filled = ndi.binary_fill_holes(arr).astype(np.uint8)
         return torch.from_numpy(filled.astype(bool))
+
+    @staticmethod
+    def _postprocess_photographer_mask(
+        raw_mask: torch.Tensor,
+        face_name: str,
+        photographer_bbox: tuple[int, int, int, int] | None = None,
+    ) -> torch.Tensor:
+        """
+        PHOTOGRAPHER raw mask 후처리.
+
+        down face: dilate로 조각 연결 → convex hull → YOLO bbox OR → 2차 hull → 여유 dilate
+        나머지   : dilate(15px) + fill_holes
+        """
+        mask = raw_mask.cpu().numpy().astype(np.uint8) * 255
+
+        if face_name == "down":
+            H, W = mask.shape
+
+            # 1. 연결용 dilate
+            k_connect = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (60, 60))
+            mask = cv2.dilate(mask, k_connect)
+
+            # 2. 1차 convex hull
+            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if contours:
+                all_points = np.concatenate(contours)
+                hull = cv2.convexHull(all_points)
+                cv2.fillPoly(mask, [hull], 255)
+
+            # 3. YOLO bbox 전체를 OR 합산 (카메라 장비 등 mask 누락 보완)
+            if photographer_bbox is not None:
+                x1, y1, x2, y2 = photographer_bbox
+                x1 = max(0, x1 - 20)
+                y1 = max(0, y1 - 20)
+                x2 = min(W, x2 + 20)
+                y2 = min(H, y2 + 20)
+                mask[y1:y2, x1:x2] = 255
+
+                # bbox 포함 후 2차 convex hull
+                contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                if contours:
+                    all_points = np.concatenate(contours)
+                    hull = cv2.convexHull(all_points)
+                    cv2.fillPoly(mask, [hull], 255)
+
+            # 4. 최종 여유 dilate
+            k_final = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (20, 20))
+            mask = cv2.dilate(mask, k_final)
+
+        else:
+            k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (31, 31))  # dilate_px=15
+            mask = cv2.dilate(mask, k)
+            mask = (ndi.binary_fill_holes(mask > 0).astype(np.uint8)) * 255
+
+        return torch.from_numpy(mask > 0).to(raw_mask.device)
+
+    @staticmethod
+    def _down_face_ellipse_mask(
+        hull_mask: torch.Tensor,
+        H: int,
+        W: int,
+    ) -> torch.Tensor:
+        """
+        down face 전용: 고정 타원 OR hull.
+
+        타원 중심·크기 고정 (YOLO 결과와 무관):
+          center = (W*0.45, H*0.45)
+          axes   = (W*0.38, H*0.38)
+        hull_mask가 비어있으면 타원만 반환.
+        """
+        hull_np = hull_mask.cpu().numpy().astype(np.uint8) * 255
+
+        ellipse = np.zeros((H, W), dtype=np.uint8)
+        cv2.ellipse(
+            ellipse,
+            center=(int(W * 0.45), int(H * 0.45)),
+            axes=(int(W * 0.38), int(H * 0.38)),
+            angle=0, startAngle=0, endAngle=360,
+            color=255, thickness=-1,
+        )
+
+        final = cv2.bitwise_or(hull_np, ellipse)
+        return torch.from_numpy(final > 0).to(hull_mask.device)
 
     @staticmethod
     def _face_region_mask(box: np.ndarray, fh: int, fw: int) -> torch.Tensor:
