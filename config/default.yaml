@@ -1,0 +1,44 @@
+# ============================================================
+# 360° 이미지 사람 제거 파이프라인 — 기본 설정
+# ============================================================
+
+# ── 실행 환경 ────────────────────────────────────────────────
+device: cuda                    # cuda | cpu
+
+# ── CubeMap 변환 ─────────────────────────────────────────────
+cubemap_face_size: 1024         # 각 face의 픽셀 크기 (정사각형)
+
+# ── Segmentation 모델 ────────────────────────────────────────
+yolo_model: yolo11x-seg.pt      # ultralytics YOLO11 세그멘테이션 모델
+sam2_model: sam2_hiera_large.pt # Meta SAM2 체크포인트
+sam2_config: sam2_hiera_l.yaml  # SAM2 모델 설정 파일
+person_class_id: 0              # COCO person class index
+
+# ── 마스크 후처리 ─────────────────────────────────────────────
+mask_dilate_px: 15              # 마스크 팽창 픽셀 수 (경계 여유)
+
+# ── Feature Matching ────────────────────────────────────────
+feature_matcher: loftr          # loftr | superpoint | sift
+loftr_pretrained: outdoor       # outdoor | indoor
+sift_n_features: 5000
+min_match_count: 10             # 최소 유효 매칭 수
+
+# ── 배경 복원 판단 ────────────────────────────────────────────
+min_coverage_ratio: 0.85        # 이 비율 이상 채워지면 inpainting 생략
+
+# ── LaMa Inpainting ─────────────────────────────────────────
+lama_enabled: true
+lama_device: cuda               # cuda | cpu
+
+# ── 배치 처리 ────────────────────────────────────────────────
+batch_size: 4                   # 동시 처리 이미지 수
+
+# ── 경로 ────────────────────────────────────────────────────
+input_dir: ./input
+output_dir: ./output
+model_dir: ./models             # 다운로드된 모델 가중치 저장 위치
+
+# ── 디버그 / 시각화 ──────────────────────────────────────────
+save_debug_masks: false         # 중간 마스크 저장 여부
+save_cubemap_faces: false       # CubeMap face 저장 여부
+log_level: INFO                 # DEBUG | INFO | WARNING | ERROR

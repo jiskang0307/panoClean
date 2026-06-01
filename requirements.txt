@@ -1,0 +1,35 @@
+# ============================================================
+# 360° 이미지 사람 제거 파이프라인 — 의존 라이브러리
+# Python 3.10+  /  CUDA 11.8+
+# ============================================================
+
+# ── PyTorch (CUDA 11.8) ──────────────────────────────────────
+# 설치 시 아래 명령어 사용:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
+torch>=2.2.0
+torchvision>=0.17.0
+
+# ── Segmentation ────────────────────────────────────────────
+ultralytics>=8.3.0          # YOLO11-seg
+# SAM2: pip install git+https://github.com/facebookresearch/segment-anything-2
+
+# ── ERP / CubeMap 변환 ───────────────────────────────────────
+equilib>=0.2.4              # CUDA 지원 equirectangular ↔ cubemap
+
+# ── Feature Matching ────────────────────────────────────────
+kornia>=0.7.3               # LoFTR, feature extraction 유틸
+
+# ── Inpainting ──────────────────────────────────────────────
+simple-lama-inpainting>=0.0.3
+
+# ── 이미지 처리 ──────────────────────────────────────────────
+opencv-python-headless>=4.10.0
+Pillow>=10.3.0
+scipy>=1.13.0
+numpy>=1.26.0
+
+# ── 유틸리티 ────────────────────────────────────────────────
+tqdm>=4.66.0
+pyyaml>=6.0.1
+loguru>=0.7.2
+matplotlib>=3.9.0
