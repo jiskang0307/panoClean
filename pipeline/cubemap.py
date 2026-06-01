@@ -128,33 +128,58 @@ class CubeMapConverter:
         """
         6개 face dict를 ERP tensor로 합성.
 
-        면 경계는 8px gaussian blend로 처리.
-        no_blend_faces에 포함된 face는 seam blend 없이 원본 그대로 합성.
+        no_blend_faces에 포함된 face는 변환 라이브러리의 내부 blending을 거치지 않고
+        UV 역변환으로 직접 hard composite — 경계 번짐 방지.
 
         Args:
             faces          : erp_to_cubemap 반환값과 동일한 구조.
             erp_height     : 출력 ERP 높이.
             erp_width      : 출력 ERP 너비.
-            no_blend_faces : seam blend를 생략할 face 이름 목록.
-                             기본값 ("down",) — 넓은 inpainting 영역 번짐 방지.
+            no_blend_faces : 직접 합성할 face 이름. 기본값 ("down",).
 
         Returns:
             (3, erp_height, erp_width) float32 tensor (device 유지).
         """
-        # no_blend_faces는 blend_seams에 넣지 않고 원본 그대로 사용
-        blend_input  = {k: v for k, v in faces.items() if k not in no_blend_faces}
-        pass_through = {k: v for k, v in faces.items() if k in no_blend_faces}
-
+        # ── Step 1: side face seam blend ──────────────────────────────────
+        blend_input = {k: v for k, v in faces.items() if k not in no_blend_faces}
         blended = self.blend_seams(blend_input)
-        blended.update(pass_through)   # down face 원본 그대로 삽입
+
+        # ── Step 2: ERP_base — no_blend_faces 위치에 zero placeholder ────
+        ref = next(iter(faces.values()))
+        faces_for_erp = dict(blended)
+        for fn in FACE_NAMES:
+            if fn not in faces_for_erp:
+                # blend_seams 출력에 없는 face(= no_blend_faces + 원래 누락)는 zero
+                faces_for_erp[fn] = torch.zeros_like(ref)
+
         logger.debug(f"cubemap_to_erp: → ({erp_height}, {erp_width})")
-
         if _BACKEND == "equilib":
-            erp = self._cube2equi_equilib(blended, erp_height, erp_width)
+            erp_base = self._cube2equi_equilib(faces_for_erp, erp_height, erp_width)
         else:
-            erp = self._cube2equi_py360(blended, erp_height, erp_width)
+            erp_base = self._cube2equi_py360(faces_for_erp, erp_height, erp_width)
 
-        return erp
+        # ── Step 3: no_blend_faces를 UV 역변환으로 hard composite ─────────
+        erp_final = erp_base
+        for fn in no_blend_faces:
+            if fn not in faces:
+                continue
+            grid, valid = self._erp_to_face_uv_grid(fn, erp_height, erp_width)
+            sampled = F.grid_sample(
+                faces[fn].unsqueeze(0).to(self.device),
+                grid,
+                mode="bilinear",
+                align_corners=True,
+                padding_mode="border",
+            ).squeeze(0)  # (3, erp_h, erp_w)
+
+            if id(erp_final) == id(erp_base):
+                erp_final = erp_base.clone()
+            erp_final[:, valid] = sampled[:, valid]
+            logger.debug(
+                f"cubemap_to_erp: [{fn}] hard composite {valid.sum().item()} px"
+            )
+
+        return erp_final
 
     # ── 배치 처리 ─────────────────────────────────────────────────────────
 
@@ -250,6 +275,93 @@ class CubeMapConverter:
             result[src][:, :, :w] = s_e2 * (1 - blend_w) + d_e2 * blend_w
 
         return result
+
+    # ── UV 역변환 헬퍼 ────────────────────────────────────────────────────
+
+    def _erp_to_face_uv_grid(
+        self, face_name: FaceName, erp_h: int, erp_w: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        ERP 전체 픽셀에 대해 해당 face의 UV 좌표(및 유효 마스크)를 계산.
+
+        Returns:
+            grid  : (1, erp_h, erp_w, 2) float32 in [-1, 1] — F.grid_sample 용
+            valid : (erp_h, erp_w) bool — 해당 face에 속하는 픽셀 마스크
+        """
+        device = self.device
+
+        # ERP 픽셀 → 구면 좌표
+        v_erp = torch.arange(erp_h, device=device).float() / erp_h
+        u_erp = torch.arange(erp_w, device=device).float() / erp_w
+        v_grid, u_grid = torch.meshgrid(v_erp, u_erp, indexing="ij")
+
+        lat = math.pi * (0.5 - v_grid)        # [-π/2, +π/2]
+        lon = 2.0 * math.pi * (u_grid - 0.5)  # [-π, +π]
+
+        cos_lat = torch.cos(lat)
+        vx = cos_lat * torch.sin(lon)
+        vy = torch.sin(lat)
+        vz = cos_lat * torch.cos(lon)
+
+        # 3D 단위벡터 → face 로컬 좌표 ([-1,1] × [-1,1])
+        face_x, face_y, valid = self._lonlat_to_face_xy(face_name, vx, vy, vz)
+
+        # F.grid_sample 형식: (1, H, W, 2) with (x_col, y_row)
+        grid = torch.stack([face_x, face_y], dim=-1).unsqueeze(0)
+        return grid, valid
+
+    @staticmethod
+    def _lonlat_to_face_xy(
+        face: FaceName,
+        vx: torch.Tensor,
+        vy: torch.Tensor,
+        vz: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        3D 단위벡터 (vx, vy, vz) → face 로컬 좌표 (face_x, face_y) 역변환.
+
+        _dirs 정의의 역산:
+          front  = (x, -y,  1)/n  → face_x=vx/vz,   face_y=-vy/vz,  vz>0
+          back   = (-x,-y, -1)/n  → face_x=vx/vz,   face_y=vy/vz,   vz<0
+          right  = (1, -y, -x)/n  → face_x=-vz/vx,  face_y=-vy/vx,  vx>0
+          left   = (-1,-y,  x)/n  → face_x=-vz/vx,  face_y=vy/vx,   vx<0
+          up     = (x,  1,  y)/n  → face_x=vx/vy,   face_y=vz/vy,   vy>0
+          down   = (x, -1, -y)/n  → face_x=-vx/vy,  face_y=vz/vy,   vy<0
+
+        Returns:
+            face_x, face_y : 각각 (erp_h, erp_w) float32 in [-1, 1]
+            valid          : (erp_h, erp_w) bool
+        """
+        eps = 1e-8
+
+        if face == "front":
+            d = vz.clamp(min=eps)
+            fx, fy = vx / d, -vy / d
+            valid = (vz > 0) & (fx.abs() <= 1.0) & (fy.abs() <= 1.0)
+        elif face == "back":
+            d = vz.clamp(max=-eps)
+            fx, fy = vx / d, vy / d
+            valid = (vz < 0) & (fx.abs() <= 1.0) & (fy.abs() <= 1.0)
+        elif face == "right":
+            d = vx.clamp(min=eps)
+            fx, fy = -vz / d, -vy / d
+            valid = (vx > 0) & (fx.abs() <= 1.0) & (fy.abs() <= 1.0)
+        elif face == "left":
+            d = vx.clamp(max=-eps)
+            fx, fy = -vz / d, vy / d
+            valid = (vx < 0) & (fx.abs() <= 1.0) & (fy.abs() <= 1.0)
+        elif face == "up":
+            d = vy.clamp(min=eps)
+            fx, fy = vx / d, vz / d
+            valid = (vy > 0) & (fx.abs() <= 1.0) & (fy.abs() <= 1.0)
+        elif face == "down":
+            d = vy.clamp(max=-eps)
+            fx, fy = -vx / d, vz / d
+            valid = (vy < 0) & (fx.abs() <= 1.0) & (fy.abs() <= 1.0)
+        else:
+            raise ValueError(f"Unknown face: {face}")
+
+        return fx, fy, valid
 
     # ── 내부: equilib 호출 ────────────────────────────────────────────────
 
