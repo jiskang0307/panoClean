@@ -3,9 +3,9 @@
 # Python 3.10+  /  CUDA 11.8+
 # ============================================================
 
-# ── PyTorch (CUDA 11.8) ──────────────────────────────────────
+# ── PyTorch (CUDA 12.4 권장 — CUDA 13.0 드라이버에서 동작) ──────
 # 설치 시 아래 명령어 사용:
-#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
 torch>=2.2.0
 torchvision>=0.17.0
 
@@ -20,6 +20,9 @@ equilib>=0.2.4              # CUDA 지원 equirectangular ↔ cubemap
 kornia>=0.7.3               # LoFTR, feature extraction 유틸
 
 # ── Inpainting ──────────────────────────────────────────────
+# numpy<2.0 제약이 과보수적이므로 --no-deps 설치 필요:
+#   pip install simple-lama-inpainting --no-deps
+#   pip install "fire>=0.5.0,<0.6.0"
 simple-lama-inpainting>=0.0.3
 
 # ── 이미지 처리 ──────────────────────────────────────────────
