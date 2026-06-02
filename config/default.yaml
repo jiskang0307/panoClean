@@ -34,6 +34,11 @@ lama_down_face_size: 256        # down face inpainting 다운샘플 해상도
 lama_feather_px: 8              # 일반 face 경계 feathering sigma (px)
 lama_down_feather_px: 0         # down face 경계 feathering sigma (px) — 0=hard composite
 
+# ── Down face 처리 방식 ──────────────────────────────────────
+down_face_method: solid         # solid | blur | lama
+down_blur_kernel: 251           # GaussianBlur 커널 크기 (홀수, 2회 적용)
+down_blur_feather: 101          # mask 경계 feathering 커널 크기 (홀수)
+
 # ── 배치 처리 ────────────────────────────────────────────────
 batch_size: 4                   # 동시 처리 이미지 수
 

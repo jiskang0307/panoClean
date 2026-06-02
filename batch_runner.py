@@ -250,6 +250,9 @@ def main() -> None:
         down_face_size=cfg.get("lama_down_face_size", 256),
         feather_px=cfg.get("lama_feather_px", 8),
         down_feather_px=cfg.get("lama_down_feather_px", 30),
+        down_face_method=cfg.get("down_face_method", "lama"),
+        down_blur_kernel=cfg.get("down_blur_kernel", 151),
+        down_blur_feather=cfg.get("down_blur_feather", 61),
     )
     mosaicker = FaceMosaicker(
         mosaic_block_size=cfg.get("mosaic_block_size", 20),

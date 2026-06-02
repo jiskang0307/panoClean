@@ -1,10 +1,15 @@
 """
-inpainting.py — LaMa 기반 마스크 영역 복원.
+inpainting.py — LaMa 기반 마스크 영역 복원 + blur fallback.
 
 simple-lama-inpainting 래핑:
   - inpaint_face()       : 일반 face, 원본 해상도 (down face는 512px 다운샘플)
   - inpaint_down_face()  : down face 전용, 256px 다운샘플, 30px feathering
-  - inpaint_residual()   : 배경 교체 후 잔여 영역 처리 (down → inpaint_down_face)
+  - blur_down_face()       : down face 전용, Gaussian blur (LaMa 없이 동작)
+  - solid_fill_down_face() : down face 전용, 주변 평균색 단색 fill + feathering
+  - inpaint_residual()   : 배경 교체 후 잔여 영역 처리
+                           down_face_method="blur"  → blur_down_face()
+                           down_face_method="solid" → solid_fill_down_face()
+                           down_face_method="lama"  → inpaint_down_face()
   - inpaint_all_faces()  : 6개 face 전부 (down 먼저)
 """
 
@@ -32,6 +37,9 @@ class LamaInpainter:
         down_face_size: int = 256,
         feather_px: int = 8,
         down_feather_px: int = 30,
+        down_face_method: str = "lama",   # "lama" | "blur" | "solid"
+        down_blur_kernel: int = 151,      # GaussianBlur 커널 크기 (홀수)
+        down_blur_feather: int = 61,      # mask 경계 feathering 커널 크기 (홀수)
     ) -> None:
         self.device = device
         self.debug_dir = Path(debug_dir) if debug_dir else None
@@ -39,6 +47,9 @@ class LamaInpainter:
         self.down_face_size = down_face_size
         self.feather_px = feather_px
         self.down_feather_px = down_feather_px
+        self.down_face_method = down_face_method
+        self.down_blur_kernel = down_blur_kernel if down_blur_kernel % 2 == 1 else down_blur_kernel + 1
+        self.down_blur_feather = down_blur_feather if down_blur_feather % 2 == 1 else down_blur_feather + 1
         self.lama = None
         self.available = False
         self._try_load()
@@ -168,6 +179,74 @@ class LamaInpainter:
 
         return blended
 
+    def blur_down_face(
+        self,
+        face_img: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        down face 전용 Gaussian blur 복원 (LaMa 불필요).
+
+        1. 전체 이미지에 강한 Gaussian blur 2회 적용 (double blur)
+        2. mask 경계를 feathering으로 자연스럽게 전환
+        """
+        img_np   = (face_img.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+        mask_np  = mask.cpu().numpy().astype(np.uint8)
+
+        k_blur    = (self.down_blur_kernel, self.down_blur_kernel)
+        k_feather = (self.down_blur_feather, self.down_blur_feather)
+
+        blurred = cv2.GaussianBlur(img_np, k_blur, 0)
+        blurred = cv2.GaussianBlur(blurred, k_blur, 0)   # 2회 적용
+        feather = cv2.GaussianBlur(mask_np.astype(np.float32), k_feather, 0)
+        feather = feather[:, :, np.newaxis]   # (H,W,1) for broadcast
+
+        result_np = (img_np * (1.0 - feather) + blurred * feather).astype(np.uint8)
+        result_t  = torch.from_numpy(result_np).permute(2, 0, 1).float() / 255.0
+
+        if self.debug_dir:
+            self._save_diff_debug(face_img, result_t, mask, "down_blur")
+
+        return result_t.to(face_img.device)
+
+    def solid_fill_down_face(
+        self,
+        face_img: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        down face 전용 단색 fill 복원.
+
+        1. mask 바깥 10px 링의 평균 색상 샘플링
+        2. mask 영역 전체를 그 색상으로 채움
+        3. 경계 40px feathering으로 자연스럽게 전환
+        """
+        img_np  = (face_img.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+        mask_np = mask.cpu().numpy().astype(np.uint8)
+
+        # mask 바깥 10px 링 (dilate 21×21 − mask)
+        kernel  = np.ones((21, 21), np.uint8)
+        dilated = cv2.dilate(mask_np, kernel)
+        ring    = (dilated - mask_np).astype(bool)
+
+        avg_color = img_np[ring].mean(axis=0) if ring.any() else np.array([128, 128, 128], dtype=np.float64)
+
+        # mask 영역을 평균 색상으로 채움
+        result_np = img_np.copy()
+        result_np[mask_np.astype(bool)] = avg_color.astype(np.uint8)
+
+        # 경계 feathering (40px → kernel 81)
+        feather   = cv2.GaussianBlur(mask_np.astype(np.float32), (81, 81), 0)
+        feather   = feather[:, :, np.newaxis]
+        result_np = (img_np * (1.0 - feather) + result_np * feather).astype(np.uint8)
+
+        result_t = torch.from_numpy(result_np).permute(2, 0, 1).float() / 255.0
+
+        if self.debug_dir:
+            self._save_diff_debug(face_img, result_t, mask, "down_solid")
+
+        return result_t.to(face_img.device)
+
     def inpaint_residual(
         self,
         face_img: torch.Tensor,
@@ -186,6 +265,12 @@ class LamaInpainter:
         if face_name == "down":
             if not original_mask.any():
                 return face_img, False
+            if self.down_face_method == "blur":
+                result = self.blur_down_face(face_img, original_mask)
+                return result, True
+            if self.down_face_method == "solid":
+                result = self.solid_fill_down_face(face_img, original_mask)
+                return result, True
             result = self.inpaint_down_face(face_img, original_mask)
             return result, self.available
 

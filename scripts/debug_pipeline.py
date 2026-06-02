@@ -105,6 +105,7 @@ print(f"출력  : {DEBUG_OUT}/")
 # ── 모듈 로드 ─────────────────────────────────────────────────────────────
 
 from pipeline.cubemap import CubeMapConverter, load_erp, save_erp
+from pipeline.inpainting import LamaInpainter
 from pipeline.segmentation import PersonSegmenter, PersonRole
 from pipeline.matching import BackgroundMatcher, POLAR_FACES
 
@@ -123,6 +124,7 @@ cfg = {
 conv      = CubeMapConverter(face_size=FACE_SIZE, device=DEVICE)
 segmenter = PersonSegmenter(cfg)
 matcher   = BackgroundMatcher(cfg)
+inpainter = LamaInpainter(device=DEVICE, debug_dir=DEBUG_OUT)
 
 
 # ── ERP 로드 + CubeMap 변환 ───────────────────────────────────────────────
@@ -216,9 +218,19 @@ for fname, face_t in faces.items():
         cv2.putText(before, "BEFORE", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,255), 2)
         cv2.putText(after,  "AFTER",  (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,0), 2)
         save(np.hstack([before, after]), f"replace_before_after_{fname}.jpg")
-        result_faces[fname] = restored
     else:
-        result_faces[fname] = face_t
+        restored = face_t
+
+    # ── LaMa inpainting ───────────────────────────────────────────────────
+    if photo_mask.any() and inpainter.available:
+        filled_mask = photo_mask & ((restored.cpu() - face_t.cpu()).abs().sum(0) > 0.02)
+        inpainted, did_inpaint = inpainter.inpaint_residual(
+            restored, photo_mask, filled_mask, face_name=fname
+        )
+        print(f"  - inpainting: did={did_inpaint}, coverage_before={coverage:.2f}")
+        result_faces[fname] = inpainted
+    else:
+        result_faces[fname] = restored
 
     # ══ 콘솔 출력 (face 단위) ═════════════════════════════════════════════
     print(f"\n[{fname}]")

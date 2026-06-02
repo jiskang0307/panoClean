@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(Get-ChildItem \"d:\\\\panoClean\" -ErrorAction SilentlyContinue; if \\(-not \\(Test-Path \"d:\\\\panoClean\"\\)\\) { Write-Host \"Directory does not exist\" })",
+      "PowerShell(Get-ChildItem \"d:\\\\panoClean\" -Recurse | Where-Object { -not $_.PSIsContainer } | Select-Object FullName)",
+      "PowerShell(Get-Command python3 -ErrorAction SilentlyContinue)",
+      "PowerShell(conda info --envs 2>$null)",
+      "PowerShell($py = \"C:\\\\Users\\\\jiskang\\\\AppData\\\\Local\\\\Programs\\\\Python\\\\Python313\\\\python.exe\"; & $py --version; & $py -c \"import torch\" 2>&1; & $py -c \"import equilib\" 2>&1; & $py -c \"import py360convert\" 2>&1)",
+      "PowerShell(nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader 2>&1)",
+      "PowerShell(New-Item -ItemType Directory -Force \"d:\\\\panoClean\\\\scripts\")",
+      "Bash(python -m pytest tests/test_segmentation.py -v --tb=short)",
+      "Bash(.venv\\\\Scripts\\\\python.exe -m pytest tests/test_segmentation.py -v --tb=short)",
+      "Bash(git commit -m ' *)",
+      "Bash(.venv\\\\Scripts\\\\python -m pytest tests/ -q --tb=short)"
+    ]
+  }
+}
