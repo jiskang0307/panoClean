@@ -64,11 +64,15 @@ def save_erp(tensor: torch.Tensor, path: str) -> None:
     (3, H, W) float32 tensor를 ERP 이미지 파일로 저장.
     확장자에 따라 PNG/JPEG 자동 선택.
     """
-    import pathlib
+    import pathlib, cv2
     arr = tensor.detach().cpu().clamp(0, 1).permute(1, 2, 0).numpy()
-    img = Image.fromarray((arr * 255).astype(np.uint8))
+    bgr = (arr[:, :, ::-1] * 255).astype(np.uint8)
     pathlib.Path(path).parent.mkdir(parents=True, exist_ok=True)
-    img.save(path)
+    ext = pathlib.Path(path).suffix.lower()
+    if ext in {".jpg", ".jpeg"}:
+        cv2.imwrite(str(path), bgr, [cv2.IMWRITE_JPEG_QUALITY, 95])
+    else:
+        cv2.imwrite(str(path), bgr)
     logger.debug(f"ERP 저장: {path}")
 
 
@@ -245,6 +249,10 @@ class CubeMapConverter:
         Returns:
             동일 구조의 새 dict (원본 불변).
         """
+        # 모든 입력 face를 동일 device로 강제 통일
+        device = next(iter(faces.values())).device
+        faces = {k: v.to(device) for k, v in faces.items()}
+
         w = self.SEAM_WIDTH
         result = {k: v.clone() for k, v in faces.items()}
 

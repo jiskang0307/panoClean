@@ -196,18 +196,59 @@ class LamaInpainter:
         if face_name == "down":
             k, passes, feather = self.down_blur_kernel, self.down_blur_passes, self.down_blur_feather
         else:
-            k, passes, feather = 151, 2, 31
+            k, passes, feather = 251, 3, 61
 
         img_np  = (face_img.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
         mask_np = mask.cpu().numpy().astype(np.uint8)
 
-        blurred = img_np.copy()
-        for _ in range(passes):
-            blurred = cv2.GaussianBlur(blurred, (k, k), 0)
+        # side face: mask가 하단 경계에 닿아 있으면 열 전체(y=0~하단)를 채움
+        # — 머리가 mask 상단 위로 노출되는 것을 방지
+        boundary_fill = False
+        if face_name in ("left", "right", "front", "back"):
+            H = mask_np.shape[0]
+            bottom_rows = np.where(mask_np.any(axis=1))[0]
+            if len(bottom_rows) > 0 and bottom_rows[-1] >= H - 50:
+                boundary_fill = True
+                col_has_mask = mask_np.any(axis=0)
+                for col in np.where(col_has_mask)[0]:
+                    col_rows = np.where(mask_np[:, col])[0]
+                    if len(col_rows) > 0:
+                        mask_np[:col_rows[-1] + 1, col] = 1  # y=0부터 mask 하단까지 채움
 
-        f = cv2.GaussianBlur(mask_np.astype(np.float32), (feather, feather), 0)
-        f = f[:, :, np.newaxis]
-        result = (img_np * (1.0 - f) + blurred * f).astype(np.uint8)
+        # mask 비율이 크면 (> 25%) solid fill 방식 사용 — 대면적 피부색 blur 한계 보완
+        if not boundary_fill and mask_np.mean() > 0.25:
+            boundary_fill = True
+
+        if boundary_fill:
+            # face 경계 접촉: solid fill → 커널 반경만큼 확장 → blur → hard mask
+            # 확장 fill이 없으면 blur 커널이 mask 바깥 피부색을 끌어들임
+            kernel_ring = np.ones((31, 31), np.uint8)
+            dilated_ring = cv2.dilate(mask_np, kernel_ring)
+            ring = (dilated_ring > 0) & (mask_np == 0)
+            avg_color = img_np[ring].mean(axis=0).astype(np.uint8) if ring.any() \
+                        else img_np.mean(axis=(0, 1)).astype(np.uint8)
+
+            # mask를 커널 반경(k//2)만큼 확장하여 blur 피부 유입 차단
+            half = k // 2
+            ext_k = np.ones((half * 2 + 1, half * 2 + 1), np.uint8)
+            extended = cv2.dilate(mask_np, ext_k)
+
+            filled = img_np.copy()
+            filled[extended > 0] = avg_color          # 확장 영역 평균색 채움
+            blurred = filled
+            for _ in range(passes):
+                blurred = cv2.GaussianBlur(blurred, (k, k), 0)
+
+            mask_bool = mask_np.astype(bool)
+            result = img_np.copy()
+            result[mask_bool] = blurred[mask_bool]    # hard mask 적용
+        else:
+            blurred = img_np.copy()
+            for _ in range(passes):
+                blurred = cv2.GaussianBlur(blurred, (k, k), 0)
+            f = cv2.GaussianBlur(mask_np.astype(np.float32), (feather, feather), 0)
+            f = f[:, :, np.newaxis]
+            result = (img_np * (1.0 - f) + blurred * f).astype(np.uint8)
 
         result_t = torch.from_numpy(result).permute(2, 0, 1).float() / 255.0
         if self.debug_dir and face_name:

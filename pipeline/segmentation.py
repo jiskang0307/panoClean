@@ -197,6 +197,12 @@ class PersonSegmenter:
         detections = self._yolo_detect(img_np, fh, fw)
         if not detections:
             logger.debug(f"[{face_name}] 검출 없음")
+            if face_name == "down":
+                # YOLO 검출 실패해도 down face는 ellipse mask 항상 적용
+                empty["photographer_mask"] = self._down_face_ellipse_mask(
+                    empty["photographer_mask"], fh, fw
+                )
+                logger.info("[down] YOLO 검출 없음 → ellipse mask 단독 적용")
             return empty
 
         # 2) SAM2 정밀화
@@ -281,11 +287,108 @@ class PersonSegmenter:
         erp_h: int,
         erp_w: int,
     ) -> dict[str, dict]:
-        """6개 face 전부 처리, 결과 dict 반환."""
-        return {
+        """6개 face 전부 처리 후 경계 촬영자 승격 후처리."""
+        seg_results = {
             name: self.segment_face(face_img, name, erp_h, erp_w)
             for name, face_img in faces.items()
         }
+        face_size = next(iter(faces.values())).shape[-1]
+        return self._promote_boundary_photographers(seg_results, face_size)
+
+    @staticmethod
+    def _promote_boundary_photographers(
+        seg_results: dict[str, dict],
+        face_size: int,
+    ) -> dict[str, dict]:
+        """
+        PHOTOGRAPHER가 검출된 face의 인접 face에서
+        하단 절반(y2 >= face_size*0.5) BACKGROUND 인물을 PHOTOGRAPHER로 승격.
+
+        경계에 걸친 촬영자가 인접 face에서 BACKGROUND로 잘못 분류된 경우 보정.
+        """
+        FACE_NEIGHBORS: dict[str, list[str]] = {
+            "front": ["left", "right"],
+            "left":  ["front", "back"],
+            "right": ["front", "back"],
+            "back":  ["left", "right"],
+        }
+
+        # 인접 face 경계 strip 위치 (photo_face, neighbor) → neighbor face에서의 x 범위
+        # blend_seams 인접 관계 기준:
+        #   back RIGHT ↔ left LEFT   / left RIGHT ↔ front LEFT
+        #   right RIGHT ↔ back LEFT  / front RIGHT ↔ right LEFT
+        NEIGHBOR_EDGE: dict[tuple[str, str], tuple[float, float]] = {
+            ("left",  "back"):  (0.5, 1.0),  # back face 오른쪽 절반
+            ("left",  "front"): (0.0, 0.5),  # front face 왼쪽 절반
+            ("right", "front"): (0.5, 1.0),  # front face 오른쪽 절반
+            ("right", "back"):  (0.0, 0.5),  # back face 왼쪽 절반
+            ("front", "right"): (0.0, 0.5),  # right face 왼쪽 절반
+            ("front", "left"):  (0.5, 1.0),  # left face 오른쪽 절반
+            ("back",  "left"):  (0.0, 0.5),  # left face 왼쪽 절반
+            ("back",  "right"): (0.5, 1.0),  # right face 오른쪽 절반
+        }
+
+        photo_faces = {
+            fn for fn, res in seg_results.items()
+            if res["photographer_mask"].any()
+        }
+
+        for face_name in photo_faces:
+            for neighbor in FACE_NEIGHBORS.get(face_name, []):
+                if neighbor not in seg_results:
+                    continue
+                res = seg_results[neighbor]
+
+                bg_idx = 0
+                promoted: list[int] = []
+
+                for i, role in enumerate(res["roles"]):
+                    if role == PersonRole.PHOTOGRAPHER:
+                        continue
+                    # BACKGROUND 후보
+                    det = res["detections"][i]
+                    y2 = float(det.box[3])
+                    if y2 >= face_size * 0.5:
+                        res["roles"][i] = PersonRole.PHOTOGRAPHER
+                        raw_mask = res["background_masks"][bg_idx]
+                        proc = PersonSegmenter._postprocess_photographer_mask(
+                            raw_mask, neighbor, photographer_bbox=None
+                        )
+                        res["photographer_mask"] = res["photographer_mask"] | proc
+                        logger.info(
+                            f"[{neighbor}] BACKGROUND→PHOTOGRAPHER 승격 "
+                            f"(인접={face_name}, y2={y2:.0f}/{face_size})"
+                        )
+                        promoted.append(bg_idx)
+                    bg_idx += 1
+
+                for idx in sorted(promoted, reverse=True):
+                    res["background_masks"].pop(idx)
+                    if idx < len(res["background_face_masks"]):
+                        res["background_face_masks"].pop(idx)
+
+                # 0-detection 이웃 face에 경계 strip 추가
+                # (촬영자가 face 경계를 넘어 인접 face에 노출되는 것 방지)
+                if not res["photographer_mask"].any():
+                    edge_frac = NEIGHBOR_EDGE.get((face_name, neighbor))
+                    if edge_frac:
+                        src_pm = seg_results[face_name]["photographer_mask"].cpu().numpy()
+                        src_rows = np.where(src_pm.any(axis=1))[0]
+                        if len(src_rows) > 0:
+                            xs = int(edge_frac[0] * face_size)
+                            xe = int(edge_frac[1] * face_size)
+                            ys = max(0, int(src_rows[0]) - 50)
+                            ye = min(face_size, int(src_rows[-1]) + 50)
+                            strip = torch.zeros(face_size, face_size, dtype=torch.bool)
+                            strip[ys:ye, xs:xe] = True
+                            dev = res["photographer_mask"].device
+                            res["photographer_mask"] = res["photographer_mask"] | strip.to(dev)
+                            logger.info(
+                                f"[{neighbor}] 경계 strip 추가 "
+                                f"(인접={face_name}, x={xs}-{xe}, y={ys}-{ye})"
+                            )
+
+        return seg_results
 
     # ── 배치 처리 ─────────────────────────────────────────────────────────
 
@@ -448,41 +551,59 @@ class PersonSegmenter:
         if face_name == "down":
             H, W = mask.shape
 
-            # 1. 연결용 dilate
-            k_connect = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (60, 60))
-            mask = cv2.dilate(mask, k_connect)
+            # ── A. YOLO bbox 기반 mask (50px 확장) ──────────────────────────
+            yolo_mask = np.zeros((H, W), dtype=np.uint8)
+            if photographer_bbox is not None:
+                x1, y1, x2, y2 = photographer_bbox
+                x1 = max(0, x1 - 50)
+                y1 = max(0, y1 - 50)
+                x2 = min(W, x2 + 50)
+                y2 = min(H, y2 + 50)
+                yolo_mask[y1:y2, x1:x2] = 255
 
-            # 2. 1차 convex hull
-            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            # ── B. SAM2 hull mask ────────────────────────────────────────────
+            k_connect = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (60, 60))
+            hull_mask = cv2.dilate(mask, k_connect)
+            contours, _ = cv2.findContours(hull_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             if contours:
                 all_points = np.concatenate(contours)
                 hull = cv2.convexHull(all_points)
-                cv2.fillPoly(mask, [hull], 255)
+                cv2.fillPoly(hull_mask, [hull], 255)
 
-            # 3. YOLO bbox 전체를 OR 합산 (카메라 장비 등 mask 누락 보완)
-            if photographer_bbox is not None:
-                x1, y1, x2, y2 = photographer_bbox
-                x1 = max(0, x1 - 20)
-                y1 = max(0, y1 - 20)
-                x2 = min(W, x2 + 20)
-                y2 = min(H, y2 + 20)
-                mask[y1:y2, x1:x2] = 255
+            # ── C. 고정 타원 mask ────────────────────────────────────────────
+            ellipse_mask = np.zeros((H, W), dtype=np.uint8)
+            cv2.ellipse(
+                ellipse_mask,
+                center=(int(W * 0.45), int(H * 0.45)),
+                axes=(int(W * 0.80), int(H * 0.80)),
+                angle=0, startAngle=0, endAngle=360,
+                color=255, thickness=-1,
+            )
 
-                # bbox 포함 후 2차 convex hull
-                contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                if contours:
-                    all_points = np.concatenate(contours)
-                    hull = cv2.convexHull(all_points)
-                    cv2.fillPoly(mask, [hull], 255)
-
-            # 4. 최종 여유 dilate
+            # ── A | B | C → 최종 여유 dilate ────────────────────────────────
+            final = cv2.bitwise_or(yolo_mask, hull_mask)
+            final = cv2.bitwise_or(final, ellipse_mask)
             k_final = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (20, 20))
-            mask = cv2.dilate(mask, k_final)
+            mask = cv2.dilate(final, k_final)
 
         else:
             k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (31, 31))  # dilate_px=15
             mask = cv2.dilate(mask, k)
             mask = (ndi.binary_fill_holes(mask > 0).astype(np.uint8)) * 255
+
+            # bbox 사각형 + 경계 여백 OR — 얼굴/머리 누락 방지
+            if photographer_bbox is not None:
+                H_m, W_m = mask.shape
+                x1, y1, x2, y2 = photographer_bbox
+                pad = 20
+                bx1 = max(0, x1 - pad)
+                by1 = max(0, y1 - pad)
+                bx2 = min(W_m, x2 + pad)
+                by2 = min(H_m, y2 + pad)
+                mask[by1:by2, bx1:bx2] = 255
+                # x=0 ~ bbox 좌측까지 채움 (back face 인접부로 연장된 head 보완)
+                if bx1 > 0:
+                    mask[by1:by2, 0:bx1] = 255
 
         return torch.from_numpy(mask > 0).to(raw_mask.device)
 
@@ -506,7 +627,7 @@ class PersonSegmenter:
         cv2.ellipse(
             ellipse,
             center=(int(W * 0.45), int(H * 0.45)),
-            axes=(int(W * 0.38), int(H * 0.38)),
+            axes=(int(W * 0.80), int(H * 0.80)),
             angle=0, startAngle=0, endAngle=360,
             color=255, thickness=-1,
         )
@@ -640,7 +761,7 @@ class FaceMosaicker:
         # Gaussian feathering
         alpha = _gaussian_feather(face_bbox_mask.numpy(), self.feather_px)  # HxWx1
         blended = img_np * (1 - alpha) + mosaic_full * alpha
-        return torch.from_numpy(blended).permute(2, 0, 1).float()
+        return torch.from_numpy(blended).permute(2, 0, 1).float().to(face_img.device)
 
     def apply_background_mosaics(
         self,
@@ -651,7 +772,7 @@ class FaceMosaicker:
         result = face_img
         for mask in seg_result.get("background_face_masks", []):
             result = self.mosaic_face(result, mask)
-        return result
+        return result.to(face_img.device)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
