@@ -4,6 +4,7 @@
 
 # ── 실행 환경 ────────────────────────────────────────────────
 device: cuda                    # cuda | cpu
+log_level: INFO                 # DEBUG | INFO | WARNING | ERROR
 
 # ── CubeMap 변환 ─────────────────────────────────────────────
 cubemap_face_size: 1024         # 각 face의 픽셀 크기 (정사각형)
@@ -17,44 +18,53 @@ person_class_id: 0              # COCO person class index
 # ── 마스크 후처리 ─────────────────────────────────────────────
 mask_dilate_px: 15              # 마스크 팽창 픽셀 수 (경계 여유)
 
+# ── PHOTOGRAPHER 판별 기준 ────────────────────────────────────
+photographer_bbox_bottom_ratio: 0.70   # face 하단 y >= face_h*0.70 이면 촬영자 후보
+
+# ── down face 전용 mask (ellipse OR hull) ─────────────────────
+down_face_ellipse:
+  cx_ratio:   0.45              # 타원 중심 x (face_w 기준 비율)
+  cy_ratio:   0.45              # 타원 중심 y (face_h 기준 비율)
+  axes_ratio: 0.38              # 장축/단축 비율 (face 크기 기준)
+
+# ── Down face 처리 방식 ──────────────────────────────────────
+down_face_method: blur          # blur | solid | lama
+down_blur_kernel: 251           # GaussianBlur 커널 크기 (홀수)
+down_blur_passes: 2             # GaussianBlur 적용 횟수
+down_blur_feather: 101          # mask 경계 feathering 커널 크기 (홀수)
+
 # ── Feature Matching ────────────────────────────────────────
-feature_matcher: loftr          # loftr | superpoint | sift
+feature_matcher: none           # none | loftr | superpoint | sift (blur 모드에서 미사용)
 loftr_pretrained: outdoor       # outdoor | indoor
 sift_n_features: 5000
 min_match_count: 10             # 최소 유효 매칭 수
+min_inlier_ratio: 0.25          # 이 미만이면 낮은 신뢰도 경고
 
-# ── 배경 복원 판단 ────────────────────────────────────────────
+# ── 소스 선택 ────────────────────────────────────────────────
+n_adjacent: 10                  # target 앞뒤 각 n_adjacent//2 장 사용
+top_k_sources: 3                # 배경 블렌딩에 사용할 최대 소스 수
+source_clean_ratio_min: 0.50    # 촬영자 픽셀 비율이 이 이상인 소스 제외
 min_coverage_ratio: 0.85        # 이 비율 이상 채워지면 inpainting 생략
 
-# ── LaMa Inpainting ─────────────────────────────────────────
-lama_enabled: true
-lama_device: cuda               # cuda | cpu
+# ── LaMa Inpainting (side face 전용) ─────────────────────────
+lama_enabled: false             # blur 통일 모드 — LaMa 미사용
 lama_residual_threshold: 0.05   # 잔여 비율 이 미만이면 inpainting 스킵
-lama_down_face_size: 256        # down face inpainting 다운샘플 해상도
-lama_feather_px: 8              # 일반 face 경계 feathering sigma (px)
-lama_down_feather_px: 0         # down face 경계 feathering sigma (px) — 0=hard composite
+lama_down_face_size: 256        # down face lama 다운샘플 해상도 (down_face_method=lama 시)
+lama_feather_px: 8              # side face 경계 feathering sigma (px)
+lama_down_feather_px: 0         # down face feathering — 0=hard composite
 
-# ── Down face 처리 방식 ──────────────────────────────────────
-down_face_method: solid         # solid | blur | lama
-down_blur_kernel: 251           # GaussianBlur 커널 크기 (홀수, 2회 적용)
-down_blur_feather: 101          # mask 경계 feathering 커널 크기 (홀수)
+# ── 배경 인물 모자이크 ────────────────────────────────────────
+mosaic_block_size: 20           # 모자이크 블록 크기 (px)
+mosaic_feather_px: 8            # 모자이크 경계 feathering 폭 (px)
 
 # ── 배치 처리 ────────────────────────────────────────────────
-batch_size: 4                   # 동시 처리 이미지 수
+batch_size: 4                   # (레거시 — process_batch는 이미지 단위 처리)
 
 # ── 경로 ────────────────────────────────────────────────────
 input_dir: ./input
 output_dir: ./output
 model_dir: ./models             # 다운로드된 모델 가중치 저장 위치
 
-# ── Segmentation 세부 ────────────────────────────────────────
-yolo_conf: 0.4                  # YOLO 검출 신뢰도 임계값
-photographer_y_ratio: 0.40      # ERP 하단 이 비율 이내 → PHOTOGRAPHER 조건1
-photographer_size_weight: 0.5   # 크기 조건 가중치 (현재 score 계산에 반영)
-mosaic_block_size: 20           # 배경 인물 얼굴 모자이크 블록 크기 (px)
-mosaic_feather_px: 8            # 모자이크 경계 feathering 폭 (px)
-
 # ── 디버그 / 시각화 ──────────────────────────────────────────
 save_debug_masks: false         # 중간 마스크 저장 여부
 save_cubemap_faces: false       # CubeMap face 저장 여부
-log_level: INFO                 # DEBUG | INFO | WARNING | ERROR

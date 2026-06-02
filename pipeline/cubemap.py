@@ -17,17 +17,14 @@ from loguru import logger
 from PIL import Image
 from tqdm import tqdm
 
-# ── 백엔드 선택 ───────────────────────────────────────────────────────────
+# ── 백엔드 선택 — native PyTorch 우선 ────────────────────────────────────
+# py360convert/equilib의 검은 픽셀 문제를 피하기 위해 자체 UV 역변환 사용
+_BACKEND = "native"
+
 try:
-    from equilib import equi2cube, cube2equi
-    _BACKEND = "equilib"
-except ImportError:  # pragma: no cover
-    try:
-        import py360convert as p360
-        _BACKEND = "py360convert"
-        logger.warning("equilib 미설치 — py360convert fallback 사용")
-    except ImportError:
-        raise ImportError("equilib 또는 py360convert 중 하나를 설치하세요.")
+    import py360convert as p360  # equi2cube 단독 fallback용 (미사용 시 무시)
+except ImportError:
+    p360 = None
 
 logger.debug(f"cubemap backend: {_BACKEND}")
 
@@ -111,7 +108,9 @@ class CubeMapConverter:
         src = self._to_chw_tensor(erp_img).to(self.device)  # 3xHxW
         logger.debug(f"erp_to_cubemap: src={tuple(src.shape)}")
 
-        if _BACKEND == "equilib":
+        if _BACKEND == "native":
+            faces = self._equi2cube_native(src)
+        elif _BACKEND == "equilib":
             faces = self._equi2cube_equilib(src)
         else:
             faces = self._equi2cube_py360(src)
@@ -144,21 +143,30 @@ class CubeMapConverter:
         blend_input = {k: v for k, v in faces.items() if k not in no_blend_faces}
         blended = self.blend_seams(blend_input)
 
-        # ── Step 2: ERP_base — no_blend_faces 위치에 zero placeholder ────
+        # no_blend_faces는 seam blend 없이 원본 사용
+        all_faces = dict(blended)
+        for fn in no_blend_faces:
+            if fn in faces:
+                all_faces[fn] = faces[fn]
+
+        logger.debug(f"cubemap_to_erp: → ({erp_height}, {erp_width})")
+
+        # ── Step 2: ERP 합성 ───────────────────────────────────────────────
+        if _BACKEND == "native":
+            return self._cube2equi_native(all_faces, erp_height, erp_width)
+
+        # ── 레거시 경로 (py360convert / equilib) ──────────────────────────
         ref = next(iter(faces.values()))
         faces_for_erp = dict(blended)
         for fn in FACE_NAMES:
             if fn not in faces_for_erp:
-                # blend_seams 출력에 없는 face(= no_blend_faces + 원래 누락)는 zero
                 faces_for_erp[fn] = torch.zeros_like(ref)
 
-        logger.debug(f"cubemap_to_erp: → ({erp_height}, {erp_width})")
         if _BACKEND == "equilib":
             erp_base = self._cube2equi_equilib(faces_for_erp, erp_height, erp_width)
         else:
             erp_base = self._cube2equi_py360(faces_for_erp, erp_height, erp_width)
 
-        # ── Step 3: no_blend_faces를 UV 역변환으로 hard composite ─────────
         erp_final = erp_base
         for fn in no_blend_faces:
             if fn not in faces:
@@ -170,7 +178,7 @@ class CubeMapConverter:
                 mode="bilinear",
                 align_corners=True,
                 padding_mode="border",
-            ).squeeze(0)  # (3, erp_h, erp_w)
+            ).squeeze(0)
 
             if id(erp_final) == id(erp_base):
                 erp_final = erp_base.clone()
@@ -401,6 +409,71 @@ class CubeMapConverter:
         if out.dim() == 4:
             out = out.squeeze(0)
         return out.to(self.device).float().clamp(0, 1)
+
+    # ── 내부: native PyTorch 구현 ─────────────────────────────────────────
+
+    def _equi2cube_native(self, src: torch.Tensor) -> dict[FaceName, torch.Tensor]:
+        """
+        순수 PyTorch ERP→CubeMap.
+
+        각 face 픽셀 좌표를 3D 방향벡터 → 경도/위도 → ERP UV로 변환하고
+        F.grid_sample로 ERP에서 샘플링.
+        """
+        fs = self.face_size
+        lin = torch.linspace(-1 + 1 / fs, 1 - 1 / fs, fs, device=self.device)
+        gy, gx = torch.meshgrid(lin, lin, indexing="ij")  # (fs, fs)
+
+        faces: dict[FaceName, torch.Tensor] = {}
+        for fn in FACE_NAMES:
+            lon, lat = self._face_xy_to_lonlat(fn, gx, gy)
+
+            # lon ∈ [-π,+π] → u_gs ∈ [-1,+1]
+            u_gs = lon / math.pi
+            # lat ∈ [-π/2,+π/2] → v_gs ∈ [-1,+1]  (top=+lat → v=-1)
+            v_gs = -lat * 2.0 / math.pi
+
+            grid = torch.stack([u_gs, v_gs], dim=-1).unsqueeze(0)  # (1, fs, fs, 2)
+            sampled = F.grid_sample(
+                src.unsqueeze(0),
+                grid,
+                mode="bilinear",
+                align_corners=True,
+                padding_mode="border",
+            ).squeeze(0)  # (3, fs, fs)
+            faces[fn] = sampled.clamp(0, 1)
+        return faces
+
+    def _cube2equi_native(
+        self,
+        faces: dict[FaceName, torch.Tensor],
+        h: int,
+        w: int,
+    ) -> torch.Tensor:
+        """
+        순수 PyTorch CubeMap→ERP.
+
+        각 ERP 픽셀에 대해 해당 face UV를 계산하고 F.grid_sample로 샘플링.
+        face 처리 순서: side 4개 → up → down (down이 pole 경계 우선).
+        """
+        result = torch.zeros(3, h, w, device=self.device)
+
+        for fn in FACE_NAMES:
+            if fn not in faces:
+                continue
+            grid, valid = self._erp_to_face_uv_grid(fn, h, w)
+            if not valid.any():
+                continue
+            sampled = F.grid_sample(
+                faces[fn].unsqueeze(0).to(self.device),
+                grid,
+                mode="bilinear",
+                align_corners=True,
+                padding_mode="border",
+            ).squeeze(0)  # (3, h, w)
+            result[:, valid] = sampled[:, valid]
+            logger.debug(f"cubemap_to_erp: [{fn}] native composite {valid.sum().item()} px")
+
+        return result.clamp(0, 1)
 
     # ── 내부: py360convert fallback ───────────────────────────────────────
 

@@ -95,6 +95,12 @@ class PersonSegmenter:
         except ImportError:
             logger.warning("SAM2 미설치 — YOLO mask 단독 사용")
             self.sam2 = None
+        except FileNotFoundError:
+            logger.warning(f"SAM2 체크포인트 없음: {model_path} — YOLO mask 단독 사용")
+            self.sam2 = None
+        except Exception as e:
+            logger.warning(f"SAM2 로드 실패: {e} — YOLO mask 단독 사용")
+            self.sam2 = None
 
     # ── 역할 분류 ─────────────────────────────────────────────────────────
 

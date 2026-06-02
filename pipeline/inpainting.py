@@ -40,6 +40,7 @@ class LamaInpainter:
         down_face_method: str = "lama",   # "lama" | "blur" | "solid"
         down_blur_kernel: int = 151,      # GaussianBlur 커널 크기 (홀수)
         down_blur_feather: int = 61,      # mask 경계 feathering 커널 크기 (홀수)
+        down_blur_passes: int = 2,        # GaussianBlur 적용 횟수
     ) -> None:
         self.device = device
         self.debug_dir = Path(debug_dir) if debug_dir else None
@@ -50,6 +51,7 @@ class LamaInpainter:
         self.down_face_method = down_face_method
         self.down_blur_kernel = down_blur_kernel if down_blur_kernel % 2 == 1 else down_blur_kernel + 1
         self.down_blur_feather = down_blur_feather if down_blur_feather % 2 == 1 else down_blur_feather + 1
+        self.down_blur_passes = max(1, int(down_blur_passes))
         self.lama = None
         self.available = False
         self._try_load()
@@ -179,6 +181,39 @@ class LamaInpainter:
 
         return blended
 
+    def blur_face(
+        self,
+        face_img: torch.Tensor,
+        mask: torch.Tensor,
+        face_name: str = "",
+    ) -> torch.Tensor:
+        """
+        모든 face 공통 Gaussian blur 복원.
+
+        down : k=251, passes=2, feather=101
+        기타 : k=151, passes=2, feather=61
+        """
+        if face_name == "down":
+            k, passes, feather = self.down_blur_kernel, self.down_blur_passes, self.down_blur_feather
+        else:
+            k, passes, feather = 151, 2, 31
+
+        img_np  = (face_img.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+        mask_np = mask.cpu().numpy().astype(np.uint8)
+
+        blurred = img_np.copy()
+        for _ in range(passes):
+            blurred = cv2.GaussianBlur(blurred, (k, k), 0)
+
+        f = cv2.GaussianBlur(mask_np.astype(np.float32), (feather, feather), 0)
+        f = f[:, :, np.newaxis]
+        result = (img_np * (1.0 - f) + blurred * f).astype(np.uint8)
+
+        result_t = torch.from_numpy(result).permute(2, 0, 1).float() / 255.0
+        if self.debug_dir and face_name:
+            self._save_diff_debug(face_img, result_t, mask, f"blur_{face_name}")
+        return result_t.to(face_img.device)
+
     def blur_down_face(
         self,
         face_img: torch.Tensor,
@@ -196,8 +231,9 @@ class LamaInpainter:
         k_blur    = (self.down_blur_kernel, self.down_blur_kernel)
         k_feather = (self.down_blur_feather, self.down_blur_feather)
 
-        blurred = cv2.GaussianBlur(img_np, k_blur, 0)
-        blurred = cv2.GaussianBlur(blurred, k_blur, 0)   # 2회 적용
+        blurred = img_np.copy()
+        for _ in range(self.down_blur_passes):
+            blurred = cv2.GaussianBlur(blurred, k_blur, 0)
         feather = cv2.GaussianBlur(mask_np.astype(np.float32), k_feather, 0)
         feather = feather[:, :, np.newaxis]   # (H,W,1) for broadcast
 
