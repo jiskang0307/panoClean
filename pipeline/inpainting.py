@@ -225,8 +225,19 @@ class LamaInpainter:
             kernel_ring = np.ones((31, 31), np.uint8)
             dilated_ring = cv2.dilate(mask_np, kernel_ring)
             ring = (dilated_ring > 0) & (mask_np == 0)
-            avg_color = img_np[ring].mean(axis=0).astype(np.uint8) if ring.any() \
-                        else img_np.mean(axis=(0, 1)).astype(np.uint8)
+            if ring.any():
+                avg_color = img_np[ring].mean(axis=0).astype(np.uint8)
+            else:
+                # mask가 face 전체를 덮은 경우: 4 모서리(실제 바닥) 픽셀 샘플링
+                H_i, W_i = img_np.shape[:2]
+                margin = 30
+                corners = np.concatenate([
+                    img_np[:margin, :margin].reshape(-1, 3),    # 좌상
+                    img_np[:margin, -margin:].reshape(-1, 3),   # 우상
+                    img_np[-margin:, :margin].reshape(-1, 3),   # 좌하
+                    img_np[-margin:, -margin:].reshape(-1, 3),  # 우하
+                ])
+                avg_color = corners.mean(axis=0).astype(np.uint8)
 
             # mask를 커널 반경(k//2)만큼 확장하여 blur 피부 유입 차단
             half = k // 2
