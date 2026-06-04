@@ -11,7 +11,9 @@
       "Bash(python -m pytest tests/test_segmentation.py -v --tb=short)",
       "Bash(.venv\\\\Scripts\\\\python.exe -m pytest tests/test_segmentation.py -v --tb=short)",
       "Bash(git commit -m ' *)",
-      "Bash(.venv\\\\Scripts\\\\python -m pytest tests/ -q --tb=short)"
+      "Bash(.venv\\\\Scripts\\\\python -m pytest tests/ -q --tb=short)",
+      "Bash(python -c ' *)",
+      "Bash(python run_pipeline.py img/1779263690.762159.jpg --output_dir debug_output)"
     ]
   }
 }

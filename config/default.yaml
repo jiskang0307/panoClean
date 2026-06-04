@@ -25,7 +25,7 @@ photographer_bbox_bottom_ratio: 0.70   # face 하단 y >= face_h*0.70 이면 촬
 down_face_ellipse:
   cx_ratio:   0.45              # 타원 중심 x (face_w 기준 비율)
   cy_ratio:   0.45              # 타원 중심 y (face_h 기준 비율)
-  axes_ratio: 0.80              # 장축/단축 비율 (face 크기 기준)
+  axes_ratio: 0.38              # 장축/단축 비율 (face 크기 기준)
 
 # ── Down face 처리 방식 ──────────────────────────────────────
 down_face_method: blur          # blur | solid | lama
